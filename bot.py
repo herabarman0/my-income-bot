@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sqlite3
 import logging
 import datetime
@@ -36,7 +37,7 @@ MIN_WITHDRAW = 150
 ADMIN_USERNAME = "@luckyhera0"
 
 storage = MemoryStorage()
-# Render    ,    
+#      
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 logging.basicConfig(level=logging.INFO)
@@ -69,7 +70,6 @@ def admin_menu():
     return keyboard
 
 def get_db():
-    #     
     conn = sqlite3.connect('bot_data.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users 
@@ -117,7 +117,7 @@ async def start_command(message: types.Message, state: FSMContext):
             f"       "
         )
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("  ", callback_data="submit_pay_form"))
-        #            
+        # :             
         await message.answer(welcome_text, reply_markup=kb)
     else:
         await message.answer(f"    {user[1]}!\n   ", reply_markup=main_menu())
@@ -182,7 +182,7 @@ async def user_main_handler(message: types.Message):
     user = cursor.fetchone(); conn.close()
     if not user: return
 
-    #      
+    # :           
     if user[3] == 'pending' and any(x in message.text for x in ["  ", "  "]):
         await message.answer("           ")
         return
@@ -226,7 +226,7 @@ async def get_trx(message: types.Message, state: FSMContext):
     admin_kb = InlineKeyboardMarkup().add(InlineKeyboardButton(" Approve", callback_data=f"approve_{user_id}"),
                                            InlineKeyboardButton(" Reject", callback_data=f"reject_{user_id}"))
     await bot.send_message(ADMIN_ID, f"  \n\nID: {user_id}\n : {data['n']}\nTrxID: {message.text}", reply_markup=admin_kb)
-    #        
+    # :       
     await message.answer("        ", reply_markup=types.ReplyKeyboardRemove())
     await state.finish()
 
@@ -264,12 +264,13 @@ async def decision(call: types.CallbackQuery):
             cursor.execute("UPDATE users SET balance = balance + ?, total_refers = total_refers + 1 WHERE user_id=?", (REFER_BONUS, u[2]))
             try: await bot.send_message(u[2], f"    !  {bn_num(REFER_BONUS)}   ")
             except: pass
-        await bot.send_message(tid, " !   ", reply_markup=main_menu())
+        await bot.send_message(tid, " !         ", reply_markup=main_menu())
         await call.message.edit_text(f"  \n\n : {u[0]}\n : {tid}")
     
     elif act == "clear":
         info = call.message.text
         method_part = info.split(" :")[1].split("\n")[0].strip() if " :" in info else "Withdraw"
+        
         cursor.execute("INSERT INTO payment_reports (user_id, name, amount, method, date) VALUES (?,?,?,?,?)",
                        (tid, u[0], u[1], method_part, now))
         cursor.execute("UPDATE users SET balance = 0.0 WHERE user_id=?", (tid,))
