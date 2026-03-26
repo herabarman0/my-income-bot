@@ -19,7 +19,6 @@ def home():
     return "Bot is Active!"
 
 def run():
-    # রেন্ডার অটোমেটিক পোর্ট সেট করে দেয়
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -36,7 +35,6 @@ MIN_WITHDRAW = 150
 ADMIN_USERNAME = "@luckyhera0"
 
 storage = MemoryStorage()
-# রেন্ডারের জন্য প্রক্সি প্রয়োজন নেই, তাই সরাসরি কানেক্ট করা হলো
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 logging.basicConfig(level=logging.INFO)
@@ -116,7 +114,7 @@ async def start_command(message: types.Message, state: FSMContext):
             f"টাকা পাঠানো সম্পন্ন হলে নিচের বাটনে ক্লিক করুন।"
         )
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ পেমেন্ট করেছি", callback_data="submit_pay_form"))
-        await message.answer(welcome_text, reply_markup=kb)
+        await message.answer(welcome_text, reply_markup=kb, reply_markup=types.ReplyKeyboardRemove())
     else:
         await message.answer(f"✅ স্বাগতম সম্মানিত গ্রাহক {user[1]}!\nআপনার ড্যাশবোর্ড সক্রিয় আছে।", reply_markup=main_menu())
 
@@ -132,7 +130,7 @@ async def admin_panel_logic(message: types.Message, state: FSMContext):
                f"✅ এক্টিভ ইউজার: {stats[1] or 0} জন\n"
                f"💰 মোট ইনভেস্ট: {(stats[1] or 0) * 50} Tk\n"
                f"💸 পেন্ডিং পেআউট: {stats[2] or 0} Tk")
-        await message.answer(stats_msg) # এখানে মূল কোডে কিছুটা মিসিং ছিল, ঠিক করে দিলাম
+        await message.answer(msg)
 
     elif "👥 ইউজার লিস্ট" in message.text:
         conn = get_db(); cursor = conn.cursor()
@@ -180,6 +178,11 @@ async def user_main_handler(message: types.Message):
     user = cursor.fetchone(); conn.close()
     if not user: return
 
+    # --- এখানে ফিক্স করা হয়েছে: পেন্ডিং ইউজার বাটন ব্যবহার করতে পারবে না ---
+    if user[3] == 'pending' and any(x in message.text for x in ["📊 আমার প্রোফাইল", "💸 টাকা উত্তোলন"]):
+        await message.answer("⚠️ আপনার অ্যাকাউন্টটি এখনও সক্রিয় করা হয়নি। অ্যাডমিন এপ্রুভ করলে আপনি প্রোফাইল দেখতে পারবেন।")
+        return
+
     if "📊 আমার প্রোফাইল" in message.text:
         bot_info = await bot.get_me()
         dashboard = (f"📊 আপনার প্রোফাইল\n━━━━━━━━━━━━━━\n"
@@ -219,7 +222,8 @@ async def get_trx(message: types.Message, state: FSMContext):
     admin_kb = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}"),
                                            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}"))
     await bot.send_message(ADMIN_ID, f"🔔 ভেরিফিকেশন রিকোয়েস্ট\n━━━━━━━━━━━━━━\nID: {user_id}\nপ্রেরক নম্বর: {data['n']}\nTrxID: {message.text}", reply_markup=admin_kb)
-    await message.answer("⌛ তথ্য জমা হয়েছে। যাচাই শেষে সক্রিয় করা হবে।", reply_markup=main_menu())
+    # এখানে বাটন সরিয়ে দেওয়া হয়েছে যাতে ইউজার এপ্রুভ হওয়ার আগে ক্লিক না করতে পারে
+    await message.answer("⌛ তথ্য জমা হয়েছে। যাচাই শেষে সক্রিয় করা হবে।", reply_markup=types.ReplyKeyboardRemove())
     await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('meth_'), state=Form.selecting_method)
@@ -254,25 +258,26 @@ async def decision(call: types.CallbackQuery):
         cursor.execute("UPDATE users SET status='active' WHERE user_id=?", (tid,))
         if u[2]:
             cursor.execute("UPDATE users SET balance = balance + ?, total_refers = total_refers + 1 WHERE user_id=?", (REFER_BONUS, u[2]))
-        await bot.send_message(tid, "🎊 অভিনন্দন! অ্যাকাউন্ট সক্রিয় হয়েছে।", reply_markup=main_menu())
-        await call.message.edit_text(f"✅ অ্যাকাউন্ট এপ্রুভড\n━━━━━━━━━━━━━━\n👤 নাম: {u[0]}\n🆔 আইডি: {tid}\n⏰ সময়: {now}")
+            try: await bot.send_message(u[2], f"🎊 একজন সফলভাবে যুক্ত হয়েছে! আপনি {REFER_BONUS} টাকা বোনাস পেয়েছেন।")
+            except: pass
+        await bot.send_message(tid, "🎊 অভিনন্দন! অ্যাকাউন্ট সক্রিয় হয়েছে। এখন আপনি ড্যাশবোর্ড ব্যবহার করতে পারবেন।", reply_markup=main_menu())
+        await call.message.edit_text(f"✅ অ্যাকাউন্ট এপ্রুভড\n━━━━━━━━━━━━━━\n👤 নাম: {u[0]}\n🆔 আইডি: {tid}")
     
     elif act == "clear":
         info = call.message.text
         method_part = info.split("🏦 মেথড:")[1].split("\n")[0].strip() if "🏦 মেথড:" in info else "Withdraw"
-        
         cursor.execute("INSERT INTO payment_reports (user_id, name, amount, method, date) VALUES (?,?,?,?,?)",
                        (tid, u[0], u[1], method_part, now))
         cursor.execute("UPDATE users SET balance = 0.0 WHERE user_id=?", (tid,))
         await bot.send_message(tid, "✅ পেমেন্ট সফলভাবে পাঠানো হয়েছে।")
-        await call.message.edit_text(f"💰 পেমেন্ট ক্লিয়ার\n━━━━━━━━━━━━━━\n👤 নাম: {u[0]}\n💵 পরিমাণ: {u[1]} Tk\n🏦 মেথড: {method_part}\n⏰ সময়: {now}")
+        await call.message.edit_text(f"💰 পেমেন্ট ক্লিয়ার।")
 
     elif act == "reject":
         await bot.send_message(tid, "❌ তথ্য ভুল থাকায় বাতিল করা হয়েছে।")
-        await call.message.edit_text(f"❌ রিকোয়েস্ট রিজেক্টেড\n━━━━━━━━━━━━━━\n🆔 আইডি: {tid}\n⏰ সময়: {now}")
+        await call.message.edit_text(f"❌ রিকোয়েস্ট রিজেক্টেড।")
 
     conn.commit(); conn.close()
 
 if __name__ == '__main__':
-    keep_alive() # রেন্ডারের জন্য সার্ভার চালু করবে
+    keep_alive() 
     executor.start_polling(dp, skip_updates=True)
