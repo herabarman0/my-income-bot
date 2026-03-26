@@ -12,10 +12,10 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-# --- Render Keep-Alive System ---
+# --- Render Server Keep-Alive ---
 app = Flask('')
 @app.route('/')
-def home(): return "Server Active"
+def home(): return "Server is Running..."
 
 def run():
     port = int(os.environ.get("PORT", 8080))
@@ -25,7 +25,7 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-# --- Configuration ---
+# --- কনফিগারেশন ---
 API_TOKEN = '8432197793:AAHE3bvZYCLrVgOeJr4KNhdz0h4stcrJJow' 
 ADMIN_ID = 7125681767  
 PAYMENT_NUMBER = "01753850929" 
@@ -107,23 +107,89 @@ async def start_command(message: types.Message, state: FSMContext):
     if user[3] == 'pending':
         welcome_text = (
             f"👋 আসসালামু আলাইকুম, {user[1]}\n\n"
-            f"আমাদের বিশ্বস্ত ইনকাম প্ল্যাটফর্মে আপনাকে স্বাগতম। প্রতি রেফারে পাবেন ১৫০ পয়েন্ট বোনাস।\n\n"
+            f"আমাদের বিশ্বস্ত ইনকাম প্ল্যাটফর্মে আপনাকে স্বাগতম। এখানে প্রতি সফল রেফারে আপনি পাবেন ১৫০ পয়েন্ট বোনাস।\n\n"
             f"💰 রেফারেল ইনকাম লেভেল:\n"
             f"১. প্রাথমিক লেভেল ০-২৯৯৯ পয়েন্টে : ২৫ টাকা\n"
             f"২. ৩০০০ পয়েন্ট হলে: ৩০ টাকা\n"
             f"৩. ৫০০০ পয়েন্ট হলে: ৩৫ টাকা\n\n"
             f"💠 অ্যাকাউন্ট ভেরিফিকেশন নিয়ম:\n"
-            f"১. নিচের নম্বরে ৫০ টাকা Send Money করুন।\n"
+            f"১. নিচে দেওয়া নম্বরে ৫০ টাকা Send Money করুন।\n"
             f"📌 বিকাশ/নগদ: {PAYMENT_NUMBER}\n\n"
             f"টাকা পাঠানো শেষ হলে নিচের বাটনে ক্লিক করুন।"
         )
+        # বাটন লজিক ফিক্স করা হয়েছে (callback_data="submit_pay")
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ পেমেন্ট করেছি", callback_data="submit_pay"))
         await message.answer(welcome_text, reply_markup=kb)
     else:
         await message.answer(f"✅ স্বাগতম সম্মানিত সদস্য {user[1]}!", reply_markup=main_menu())
 
+# --- সকল কলব্যাক হ্যান্ডলার (এখানেই আপনার বাটন কাজ না করার সমস্যা ছিল) ---
+@dp.callback_query_handler(lambda c: True, state="*")
+async def process_callbacks(call: types.CallbackQuery, state: FSMContext):
+    act_data = call.data.split('_')
+    act = act_data[0]
+    
+    conn = get_db(); cursor = conn.cursor()
+
+    if act == "submit_pay":
+        await Form.waiting_for_pay_num.set()
+        await call.message.answer("📱 ধাপ-১: যে নম্বর থেকে টাকা পাঠিয়েছেন তা লিখুন:")
+
+    elif act == "approve":
+        tid = int(act_data[1])
+        cursor.execute("SELECT full_name, referred_by FROM users WHERE user_id=?", (tid,))
+        u = cursor.fetchone()
+        cursor.execute("UPDATE users SET status='active' WHERE user_id=?", (tid,))
+        if u[1]:
+            cursor.execute("SELECT points FROM users WHERE user_id=?", (u[1],))
+            ref_points = cursor.fetchone()[0]
+            bonus = 25.0
+            if ref_points >= 5000: bonus = 35.0
+            elif ref_points >= 3000: bonus = 30.0
+            cursor.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ?, points = points + 150 WHERE user_id=?", (bonus, bonus, u[1]))
+            try: await bot.send_message(u[1], f"🎊 অভিনন্দন! আপনার রেফারে একজন নতুন মেম্বার যুক্ত হয়েছে। আপনি {bn_num(bonus)} টাকা বোনাস পেয়েছেন।")
+            except: pass
+        await bot.send_message(tid, f"✅ অভিনন্দন! আপনার অ্যাকাউন্টটি সক্রিয় হয়েছে।", reply_markup=main_menu())
+        await call.message.edit_text(f"✅ আইডি {tid} এপ্রুভড।")
+
+    elif act == "reject":
+        tid = int(act_data[1])
+        await bot.send_message(tid, "❌ দুঃখিত! আপনার পেমেন্ট তথ্য সঠিক নয়।")
+        await call.message.edit_text(f"❌ আইডি {tid} বাতিল।")
+
+    elif act == "clear":
+        tid = int(act_data[1])
+        cursor.execute("UPDATE users SET balance = 0.0 WHERE user_id=?", (tid,))
+        await bot.send_message(tid, "✅ আপনার পেমেন্ট সম্পন্ন হয়েছে।")
+        await call.message.edit_text(f"💰 পেমেন্ট ক্লিয়ার।")
+
+    elif act == "w":
+        method = act_data[1]
+        await state.update_data(m=method); await Form.waiting_for_withdraw_num.set()
+        await call.message.edit_text(f"✅ আপনি {method} নির্বাচন করেছেন। নম্বরটি লিখুন:")
+
+    conn.commit(); conn.close()
+
+# --- FSM মেথড হ্যান্ডলার ---
+@dp.message_handler(state=Form.waiting_for_pay_num)
+async def get_pay_num(message: types.Message, state: FSMContext):
+    await state.update_data(n=message.text); await Form.waiting_for_trx_id.set()
+    await message.answer("🆔 ধাপ-২: ট্রানজেকশন আইডি (TrxID) লিখুন:")
+
+@dp.message_handler(state=Form.waiting_for_trx_id)
+async def get_trx(message: types.Message, state: FSMContext):
+    d = await state.get_data(); uid = message.from_user.id
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject_{uid}")
+    )
+    await bot.send_message(ADMIN_ID, f"🔔 ভেরিফিকেশন আবেদন\nআইডি: {uid}\nনম্বর: {d['n']}\nTrxID: {message.text}", reply_markup=kb)
+    await message.answer("⌛ তথ্য জমা হয়েছে। যাচাই শেষে সক্রিয় করা হবে।", reply_markup=types.ReplyKeyboardRemove())
+    await state.finish()
+
+# --- ইউজার বাটন হ্যান্ডলার ---
 @dp.message_handler(state=None)
-async def user_panel(message: types.Message):
+async def user_main_logic(message: types.Message):
     user_id = message.from_user.id
     conn = get_db(); cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
@@ -131,7 +197,7 @@ async def user_panel(message: types.Message):
     if not user: return
 
     if user[3] == 'pending' and message.text != "ℹ️ ইনকাম তথ্য":
-        await message.answer("⚠️ আপনার অ্যাকাউন্টটি এখনও সক্রিয় করা হয়নি। অ্যাডমিন এপ্রুভ করলে ড্যাশবোর্ড সচল হবে।")
+        await message.answer("⚠️ আপনার অ্যাকাউন্ট এখনও সক্রিয় নয়।")
         return
 
     if "📊 আমার প্রোফাইল" in message.text:
@@ -145,106 +211,33 @@ async def user_panel(message: types.Message):
     elif "🎁 ডেইলি বোনাস" in message.text:
         today = datetime.datetime.now().strftime("%d-%m-%Y")
         if user[7] == today:
-            await message.answer("❌ আপনি আজকে বোনাস নিয়েছেন। আগামীকাল আবার চেষ্টা করুন।")
+            await message.answer("❌ আপনি আজকে অলরেডি বোনাস নিয়েছেন।")
         else:
             conn = get_db(); cursor = conn.cursor()
-            join_date = datetime.datetime.strptime(user[8], "%d-%m-%Y")
-            days_active = (datetime.datetime.now() - join_date).days
-            if days_active <= 7:
-                bonus_val = 1.0
-                cursor.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ?, last_bonus = ? WHERE user_id = ?", (bonus_val, bonus_val, today, user_id))
-                await message.answer("✅ আপনি ১ টাকা ডেইলি বোনাস পেয়েছেন।")
-            else:
-                cursor.execute("UPDATE users SET points = points + 10, last_bonus = ? WHERE user_id = ?", (today, user_id))
-                await message.answer("✅ আপনি ১০ পয়েন্ট ডেইলি বোনাস পেয়েছেন।")
+            cursor.execute("UPDATE users SET balance = balance + 1, total_earned = total_earned + 1, last_bonus = ? WHERE user_id = ?", (today, user_id))
             conn.commit(); conn.close()
+            await message.answer("✅ অভিনন্দন! আপনি ১ টাকা ডেইলি বোনাস পেয়েছেন।")
 
     elif "💸 টাকা উত্তোলন" in message.text:
         if user[4] < MIN_WITHDRAW:
-            await message.answer(f"❌ টাকা উত্তোলন করতে ব্যালেন্স কমপক্ষে {bn_num(MIN_WITHDRAW)} টাকা হতে হবে।")
+            await message.answer(f"❌ টাকা উত্তোলন করতে কমপক্ষে {bn_num(MIN_WITHDRAW)} টাকা হতে হবে।")
         else:
             kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🟠 বিকাশ", callback_data="w_Bkash"), InlineKeyboardButton("🔴 নগদ", callback_data="w_Nagad"))
             await Form.selecting_method.set()
             await message.answer("🏦 পেমেন্ট মেথড নির্বাচন করুন:", reply_markup=kb)
 
     elif "ℹ️ ইনকাম তথ্য" in message.text:
-        await message.answer("ℹ️ ইনকাম গাইডলাইন\n━━━━━━━━━━━━━━\nপ্রতি রেফারে ১৫০ পয়েন্ট পাবেন। পয়েন্ট বাড়লে ইনকাম লেভেল বাড়বে।")
+        await message.answer("ℹ️ ইনকাম তথ্য\n━━━━━━━━━━━━━━\nপ্রতি রেফারে ১৫০ পয়েন্ট। পয়েন্ট বাড়লে ইনকাম লেভেল বাড়বে।")
 
     elif "📞 কাস্টমার সাপোর্ট" in message.text:
         await message.answer(f"👨‍💻 অ্যাডমিন আইডি: {ADMIN_USERNAME}")
 
-@dp.callback_query_handler(lambda c: c.data.startswith(('approve_', 'reject_', 'clear_', 'w_', 'submit_pay')), state="*")
-async def callbacks(call: types.CallbackQuery, state: FSMContext):
-    act_data = call.data.split('_')
-    act = act_data[0]; tid = int(act_data[1]) if len(act_data) > 1 else 0
-    conn = get_db(); cursor = conn.cursor()
-
-    if act == "submit_pay":
-        await Form.waiting_for_pay_num.set()
-        await call.message.answer("📱 ধাপ-১: যে নম্বর থেকে টাকা পাঠিয়েছেন তা লিখুন:")
-
-    elif act == "approve":
-        cursor.execute("SELECT full_name, referred_by FROM users WHERE user_id=?", (tid,))
-        u = cursor.fetchone()
-        cursor.execute("UPDATE users SET status='active' WHERE user_id=?", (tid,))
-        if u[1]:
-            cursor.execute("SELECT points FROM users WHERE user_id=?", (u[1],))
-            ref_points = cursor.fetchone()[0]
-            bonus = 25.0
-            if ref_points >= 5000: bonus = 35.0
-            elif ref_points >= 3000: bonus = 30.0
-            cursor.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ?, points = points + 150 WHERE user_id=?", (bonus, bonus, u[1]))
-            try: await bot.send_message(u[1], f"🎊 রেফার বোনাস {bn_num(bonus)} টাকা পেয়েছেন।")
-            except: pass
-        await bot.send_message(tid, "🎊 আপনার অ্যাকাউন্ট সক্রিয় হয়েছে।", reply_markup=main_menu())
-        await call.message.edit_text(f"✅ আইডি {tid} এপ্রুভড।")
-
-    elif act == "clear":
-        cursor.execute("UPDATE users SET balance = 0.0 WHERE user_id=?", (tid,))
-        await bot.send_message(tid, "✅ পেমেন্ট সফল হয়েছে।")
-        await call.message.edit_text(f"💰 পেমেন্ট ক্লিয়ার।")
-
-    elif act == "w":
-        method = act_data[1]
-        await state.update_data(m=method); await Form.waiting_for_withdraw_num.set()
-        await call.message.edit_text(f"✅ {method} নম্বরটি দিন:")
-
-    conn.commit(); conn.close()
-
-@dp.message_handler(state=Form.waiting_for_pay_num)
-async def get_pay_num(message: types.Message, state: FSMContext):
-    await state.update_data(n=message.text); await Form.waiting_for_trx_id.set()
-    await message.answer("🆔 ধাপ-২: ট্রানজেকশন আইডি (TrxID) লিখুন:")
-
-@dp.message_handler(state=Form.waiting_for_trx_id)
-async def get_trx(message: types.Message, state: FSMContext):
-    d = await state.get_data(); uid = message.from_user.id
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"), InlineKeyboardButton("❌ Reject", callback_data=f"reject_{uid}"))
-    await bot.send_message(ADMIN_ID, f"🔔 ভেরিফিকেশন আবেদন\nআইডি: {uid}\nনম্বর: {d['n']}\nTrxID: {message.text}", reply_markup=kb)
-    await message.answer("⌛ তথ্য জমা হয়েছে। যাচাই শেষে সক্রিয় করা হবে।")
-    await state.finish()
-
-@dp.message_handler(state=Form.waiting_for_withdraw_num)
-async def withdraw_final(message: types.Message, state: FSMContext):
-    d = await state.get_data(); uid = message.from_user.id
-    conn = get_db(); cursor = conn.cursor()
-    cursor.execute("SELECT full_name, balance FROM users WHERE user_id=?", (uid,))
-    u = cursor.fetchone(); conn.close()
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ পেমেন্ট সম্পন্ন", callback_data=f"clear_{uid}"))
-    await bot.send_message(ADMIN_ID, f"💸 উইথড্র রিকোয়েস্ট\nনাম: {u[0]}\nআইডি: {uid}\nমেথড: {d['m']}\nনম্বর: {message.text}\nটাকা: {u[1]}", reply_markup=kb)
-    await message.answer("✅ রিকোয়েস্ট পাঠানো হয়েছে।", reply_markup=main_menu())
-    await state.finish()
-
-# --- Admin Handlers ---
-@dp.message_handler(lambda m: m.from_user.id == ADMIN_ID, state="*")
-async def admin_logic(message: types.Message, state: FSMContext):
-    conn = get_db(); cursor = conn.cursor()
-    if "📊 সিস্টেম ড্যাশবোর্ড" in message.text:
-        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN status='active' THEN 1 ELSE 0 END), SUM(balance) FROM users")
-        stats = cursor.fetchone()
-        await message.answer(f"📊 ড্যাশবোর্ড\n👥 মোট: {stats[0]} জন\n✅ এক্টিভ: {stats[1]} জন\n💰 ইনভেস্ট: {(stats[1] or 0) * 50} Tk\n💸 পেন্ডিং: {stats[2]} Tk")
-    conn.close()
+# --- মেইন রানার ---
+async def main():
+    # পুরনো এরর ক্লিন করার জন্য
+    await bot.delete_webhook(drop_pending_updates=True)
+    keep_alive()
+    await dp.start_polling()
 
 if __name__ == '__main__':
-    keep_alive() 
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
