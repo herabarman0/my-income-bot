@@ -7,7 +7,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from flask import Flask
 from threading import Thread
 
-# --- ফ্ল্যাস্ক সার্ভার (রেন্ডারকে সচল রাখার জন্য) ---
+# --- রেন্ডার কিপ-অ্যালাইভ সিস্টেম (Flask) ---
 app = Flask('')
 
 @app.route('/')
@@ -15,7 +15,6 @@ def home():
     return "Bot is Active!"
 
 def run():
-    # রেন্ডার পোর্ট ৮0৮0 ডিফল্ট হিসেবে ব্যবহার করে
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -31,7 +30,8 @@ REFER_BONUS = 25
 MIN_WITHDRAW = 150 
 ADMIN_USERNAME = "@luckyhera0"
 
-bot = Bot(token=API_TOKEN) # প্রোভি সরিয়ে দেওয়া হয়েছে কারণ রেন্ডারে দরকার নেই
+# রেন্ডারে চালানোর জন্য proxy সরিয়ে সরাসরি কানেক্ট করা হয়েছে
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 logging.basicConfig(level=logging.INFO)
 
@@ -158,7 +158,6 @@ async def main_handler(message: types.Message):
         await message.answer(f"যেকোনো প্রয়োজনে আমাদের সাপোর্ট টিমের সাথে কথা বলুন।\n\n👨‍💻 **অ্যাডমিন আইডি:** {ADMIN_USERNAME}")
         return
 
-    # --- অ্যাডমিন নোটিফিকেশন ---
     username = f"@{message.from_user.username}" if message.from_user.username else "নেই"
     admin_info = (
         f"📩 **নতুন একটি রিকোয়েস্ট এসেছে!**\n"
@@ -210,7 +209,13 @@ async def admin_decision(call: types.CallbackQuery):
             except: pass
             
         await bot.send_message(target_id, "🎊 **অভিনন্দন!**\nআপনার অ্যাকাউন্ট সচল হয়েছে। এখন আনলিমিটেড ইনকাম শুরু করুন!", reply_markup=main_menu())
-        updated_text = f"✅ **অ্যাকাউন্ট এপ্রুভড!**\n👤 নাম: {u_info[0]}\n💬 তথ্য: {original_info.strip()}"
+        updated_text = (
+            f"✅ **অ্যাকাউন্ট এপ্রুভড!**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 নাম: {u_info[0]}\n"
+            f"💬 পেমেন্ট তথ্য: `{original_info.strip()}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
         await call.message.edit_text(updated_text, parse_mode="Markdown")
 
     elif action == "clear":
@@ -221,7 +226,7 @@ async def admin_decision(call: types.CallbackQuery):
     elif action == "reject":
         await bot.send_message(target_id, "❌ দুঃখিত! আপনার তথ্য সঠিক ছিল না।")
         await call.message.edit_text("❌ **রিকোয়েস্ট রিজেক্ট করা হয়েছে!**")
-    
+
     conn.commit()
     conn.close()
 
@@ -230,5 +235,5 @@ async def trx_prompt(call: types.CallbackQuery):
     await call.message.answer("টাকা পাঠানোর পর অনুগ্রহ করে আপনার **নম্বর** এবং **TrxID** টি এখানে লিখে পাঠিয়ে দিন।")
 
 if __name__ == '__main__':
-    keep_alive() # রেন্ডারের জন্য সার্ভার চালু করবে
+    keep_alive() # রেন্ডার সার্ভার চালু করবে
     executor.start_polling(dp, skip_updates=True)
