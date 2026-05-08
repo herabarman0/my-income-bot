@@ -162,7 +162,6 @@ def bn(n) -> str:
 # ═══════════════════════════════════════════════════════
 class Reg(StatesGroup):
     phone    = State()
-    password = State()
     ref_code = State()
 
 class Pay(StatesGroup):
@@ -373,16 +372,6 @@ async def reg_phone(message: types.Message, state: FSMContext):
         await message.answer("❌ এই ফোন নম্বরে আগেই অ্যাকাউন্ট আছে! অন্য নম্বর দিন:")
         return
     await state.update_data(phone=phone)
-    await Reg.password.set()
-    await message.answer("🔑 একটি <b>পাসওয়ার্ড</b> সেট করুন (কমপক্ষে ৬ অক্ষর):")
-
-@dp.message_handler(state=Reg.password)
-async def reg_password(message: types.Message, state: FSMContext):
-    pw = message.text.strip()
-    if len(pw) < 6:
-        await message.answer("❌ পাসওয়ার্ড কমপক্ষে ৬ অক্ষর হতে হবে:")
-        return
-    await state.update_data(password=pw)
     await Reg.ref_code.set()
     await message.answer(
         "🎟 বন্ধুর <b>রেফার কোড</b> থাকলে লিখুন, না থাকলে <b>skip</b> লিখুন:"
@@ -420,7 +409,6 @@ async def reg_ref_code(message: types.Message, state: FSMContext):
     user_data = {
         "name":        data["name"],
         "phone":       data["phone"],
-        "pass":        data["password"],
         "referCode":   refer_code,
         "referredBy":  referred_by_uid,
         "status":      "new",
@@ -476,28 +464,47 @@ async def cmd_pay(message: types.Message, state: FSMContext):
 async def pay_method(call: types.CallbackQuery, state: FSMContext):
     method = call.data.split("_")[1]
     await state.update_data(method=method)
-    s = get_settings()
-    max_len = 10 if method == "bkash" else 8
 
     await Pay.txn_id.set()
     await call.message.answer(
         f"✅ মেথড: <b>{'বিকাশ' if method=='bkash' else 'নগদ'}</b>\n\n"
-        f"🆔 ট্রান্জেকশন আইডি দিন ({max_len} সংখ্যা):"
+        f"🆔 আপনার ট্রান্জেকশন আইডি দিন:"
     )
     await call.answer()
 
+def _validate_txn(txn: str, method: str) -> tuple[bool, str]:
+    """
+    Validate transaction ID silently.
+    Rules (hidden from user):
+      bkash: exactly 10 chars, must contain both letters and digits
+      nagad:  exactly 8 chars, must contain both letters and digits
+    Returns (is_valid, error_message)
+    """
+    expected = 10 if method == "bkash" else 8
+    txn_up   = txn.upper()
+
+    has_letter = any(c.isalpha() for c in txn_up)
+    has_digit  = any(c.isdigit() for c in txn_up)
+    is_alnum   = all(c.isalnum() for c in txn_up)
+
+    if not txn or len(txn_up) != expected:
+        return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
+    if not is_alnum:
+        return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
+    if not has_letter or not has_digit:
+        return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
+    return True, ""
+
 @dp.message_handler(state=Pay.txn_id)
 async def pay_txn_id(message: types.Message, state: FSMContext):
-    uid  = str(message.from_user.id)
-    data = await state.get_data()
-    txn  = message.text.strip()
+    uid    = str(message.from_user.id)
+    data   = await state.get_data()
+    txn    = message.text.strip()
     method = data.get("method", "bkash")
-    expected_len = 10 if method == "bkash" else 8
 
-    if not txn.isdigit() or len(txn) != expected_len:
-        await message.answer(
-            f"❌ সঠিক {expected_len} সংখ্যার ট্রান্জেকশন আইডি দিন:"
-        )
+    valid, err_msg = _validate_txn(txn, method)
+    if not valid:
+        await message.answer(err_msg)
         return
 
     user = fb_get(f"users/{uid}") or {}
