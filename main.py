@@ -93,6 +93,58 @@ def fb_delete(path: str):
         log.error(f"fb_delete error [{path}]: {e}")
 
 # ═══════════════════════════════════════════════════════
+#   LOCAL CACHE  (RAM — no TTL, invalidate-on-write)
+#
+#   শুধু  users/{uid}  নোড ক্যাশ করা হয়।
+#   যখনই কোনো ফাংশন  users/{uid}  আপডেট করে,
+#   সেই UID-এর ক্যাশ সাথে সাথে মুছে যায়।
+#   পরের রিড-এ নতুন ডেটা Firebase থেকে আসে
+#   এবং আবার ক্যাশে জমা হয়।
+# ═══════════════════════════════════════════════════════
+_user_cache: dict = {}   # { uid: user_dict }
+
+def cache_get_user(uid: str):
+    """RAM থেকে ইউজার ডেটা দাও। না থাকলে None।"""
+    return _user_cache.get(uid)
+
+def cache_set_user(uid: str, data: dict):
+    """RAM-এ ইউজার ডেটা রাখো।"""
+    if data:
+        _user_cache[uid] = dict(data)   # shallow copy
+
+def cache_invalidate_user(uid: str):
+    """ইউজারের ক্যাশ মুছে ফেলো (ডেটা পরিবর্তন হলে)।"""
+    _user_cache.pop(uid, None)
+    log.debug(f"Cache invalidated: {uid}")
+
+# ── cached user fetch (drop-in replacement for fb_get("users/uid")) ──
+def get_user(uid: str) -> dict | None:
+    """
+    প্রথমে RAM চেক করে। না থাকলে Firebase থেকে আনে
+    এবং RAM-এ রেখে দেয়।
+    """
+    cached = cache_get_user(uid)
+    if cached is not None:
+        log.debug(f"Cache HIT: {uid}")
+        return cached
+    log.debug(f"Cache MISS: {uid}  → Firebase read")
+    data = fb_get(f"users/{uid}")   # ← সরাসরি Firebase
+    if data:
+        cache_set_user(uid, data)
+    return data
+
+# ── cache-aware write helpers ──
+def update_user(uid: str, fields: dict):
+    """Firebase আপডেট করে, তারপর ক্যাশ invalidate করে।"""
+    fb_update(f"users/{uid}", fields)   # ← সরাসরি Firebase
+    cache_invalidate_user(uid)
+
+def put_user(uid: str, data: dict):
+    """Firebase-এ নতুন ইউজার রাখে, তারপর ক্যাশ সেট করে।"""
+    fb_put(f"users/{uid}", data)
+    cache_set_user(uid, data)   # নতুন ডেটাই ক্যাশে রাখো
+
+# ═══════════════════════════════════════════════════════
 #   SETTINGS HELPER
 # ═══════════════════════════════════════════════════════
 def get_settings() -> dict:
@@ -268,7 +320,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         return
 
-    user = fb_get(f"users/{uid}")
+    user = get_user(uid)
 
     # ── NEW USER ──
     if not user:
@@ -417,7 +469,7 @@ async def reg_ref_code(message: types.Message, state: FSMContext):
         "createdAt":   int(time.time() * 1000),
         "deviceId":    f"tg_{uid}",
     }
-    fb_put(f"users/{uid}", user_data)
+    put_user(uid, user_data)   # Firebase write + cache set
     await state.finish()
 
     await _show_payment_screen(message, uid, user_data, s)
@@ -429,7 +481,7 @@ async def reg_ref_code(message: types.Message, state: FSMContext):
 async def cb_start_pay(call: types.CallbackQuery, state: FSMContext):
     await state.finish()
     uid  = str(call.from_user.id)
-    user = fb_get(f"users/{uid}")
+    user = get_user(uid)
     if not user:
         await call.answer("প্রথমে /start দিন।", show_alert=True)
         return
@@ -447,7 +499,7 @@ async def cb_start_pay(call: types.CallbackQuery, state: FSMContext):
 async def cmd_pay(message: types.Message, state: FSMContext):
     await state.finish()
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}")
+    user = get_user(uid)
     if not user:
         await message.answer("প্রথমে /start দিন।")
         return
@@ -507,7 +559,7 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         await message.answer(err_msg)
         return
 
-    user = fb_get(f"users/{uid}") or {}
+    user = get_user(uid) or {}
     s    = get_settings()
 
     # Save verification request
@@ -521,7 +573,7 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         "submittedAt":   int(time.time() * 1000),
     }
     vid = fb_push("verifications", ver_data)
-    fb_update(f"users/{uid}", {"status": "review"})
+    update_user(uid, {"status": "review"})
 
     # Notify admin via Telegram
     admin_text = (
@@ -561,20 +613,20 @@ async def cb_approve_ver(call: types.CallbackQuery):
     vid    = parts[1] if len(parts) > 1 else None
     s      = get_settings()
 
-    fb_update(f"users/{uid}", {"status": "active", "verifiedAt": int(time.time() * 1000)})
+    update_user(uid, {"status": "active", "verifiedAt": int(time.time() * 1000)})
     if vid:
         fb_update(f"verifications/{vid}", {"status": "approved", "approvedAt": int(time.time() * 1000)})
 
     # Credit referrer
-    user = fb_get(f"users/{uid}") or {}
+    user = get_user(uid) or {}
     ref_uid = user.get("referredBy")
     if ref_uid:
-        ref_user = fb_get(f"users/{ref_uid}") or {}
+        ref_user = get_user(ref_uid) or {}
         ref_pts  = ref_user.get("points", 0)
         ref_bal  = ref_user.get("balance", 0)
         lvl      = get_level(ref_pts, s)
         earn     = get_earn(lvl, s)
-        fb_update(f"users/{ref_uid}", {
+        update_user(ref_uid, {
             "balance": ref_bal + earn,
             "points":  ref_pts + earn,
         })
@@ -612,7 +664,7 @@ async def cb_reject_ver(call: types.CallbackQuery):
     uid   = parts[0]
     vid   = parts[1] if len(parts) > 1 else None
 
-    fb_update(f"users/{uid}", {"status": "rejected"})
+    update_user(uid, {"status": "rejected"})
     if vid:
         fb_update(f"verifications/{vid}", {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
 
@@ -646,7 +698,7 @@ async def menu_handler(message: types.Message, state: FSMContext):
     if not await app_check(uid, message):
         return
 
-    user = fb_get(f"users/{uid}")
+    user = get_user(uid)
     if not user:
         await message.answer("প্রথমে /start দিন।")
         return
@@ -747,7 +799,7 @@ async def menu_handler(message: types.Message, state: FSMContext):
             )
         else:
             new_pts = user.get("points", 0) + bonus
-            fb_update(f"users/{uid}", {
+            update_user(uid, {
                 "points":         new_pts,
                 "lastDailyBonus": int(time.time() * 1000),
             })
@@ -869,7 +921,7 @@ async def withdraw_number(message: types.Message, state: FSMContext):
     await state.update_data(number=num)
     await Withdraw.amount.set()
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}") or {}
+    user = get_user(uid) or {}
     bal  = user.get("balance", 0)
     s    = get_settings()
     lvl  = get_level(user.get("points", 0), s)
@@ -883,7 +935,7 @@ async def withdraw_number(message: types.Message, state: FSMContext):
 @dp.message_handler(state=Withdraw.amount)
 async def withdraw_amount(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}") or {}
+    user = get_user(uid) or {}
     s    = get_settings()
     data = await state.get_data()
     lvl  = get_level(user.get("points", 0), s)
@@ -956,9 +1008,9 @@ async def cb_mark_paid(call: types.CallbackQuery):
 
     fb_update(f"withdrawals/{wid}", {"status": "success", "paidAt": int(time.time() * 1000)})
     uid  = w.get("uid")
-    user = fb_get(f"users/{uid}") or {}
+    user = get_user(uid) or {}
     new_bal = max(0, user.get("balance", 0) - float(w.get("amount", 0)))
-    fb_update(f"users/{uid}", {"balance": new_bal})
+    update_user(uid, {"balance": new_bal})
 
     try:
         await bot.send_message(
@@ -990,8 +1042,8 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
     fb_update(f"withdrawals/{wid}", {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
     # Refund
     uid  = w.get("uid")
-    user = fb_get(f"users/{uid}") or {}
-    fb_update(f"users/{uid}", {"balance": user.get("balance", 0) + float(w.get("amount", 0))})
+    user = get_user(uid) or {}
+    update_user(uid, {"balance": user.get("balance", 0) + float(w.get("amount", 0))})
 
     try:
         await bot.send_message(
@@ -1014,7 +1066,7 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
 @dp.message_handler(state=Report.message)
 async def report_message(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}") or {}
+    user = get_user(uid) or {}
 
     fb_push("reports", {
         "uid":       uid,
@@ -1024,7 +1076,7 @@ async def report_message(message: types.Message, state: FSMContext):
         "read":      False,
         "createdAt": int(time.time() * 1000),
     })
-    fb_update(f"users/{uid}", {"lastReport": int(time.time() * 1000)})
+    update_user(uid, {"lastReport": int(time.time() * 1000)})
 
     try:
         await bot.send_message(
@@ -1155,7 +1207,7 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
     # ── মেইন মেনু ──
     elif "🏠 মেইন মেনু" in txt:
-        user = fb_get(f"users/{str(message.from_user.id)}") or {}
+        user = get_user(str(message.from_user.id)) or {}
         s    = get_settings()
         await _show_home(message, str(message.from_user.id), user, s)
 
@@ -1194,7 +1246,7 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
 @dp.message_handler(commands=['status'], state="*")
 async def cmd_status(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}")
+    user = get_user(uid)
     if not user:
         await message.answer("আপনার কোনো অ্যাকাউন্ট নেই। /start দিন।")
         return
@@ -1219,7 +1271,7 @@ async def cmd_support(message: types.Message, state: FSMContext):
 @dp.message_handler(commands=['report'], state="*")
 async def cmd_report(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}") or {}
+    user = get_user(uid) or {}
     last = user.get("lastReport", 0)
     if (time.time() * 1000) - last < 86_400_000:
         await message.answer("⚠️ ২৪ ঘণ্টায় মাত্র একটি রিপোর্ট করা যাবে।")
@@ -1238,7 +1290,7 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 @dp.message_handler(state="*")
 async def fallback(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}")
+    user = get_user(uid)
     if not user or user.get("status") != "active":
         await cmd_start(message, state)
         return
