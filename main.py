@@ -208,13 +208,30 @@ def cache_invalidate_user(uid: str):
 # ── cached user fetch ──
 def get_user(uid: str) -> dict | None:
     """
-    প্রথমে RAM চেক করে। না থাকলে Firebase থেকে আনে
-    এবং RAM-এ রেখে দেয়।
+    প্রথমে RAM চেক করে। না থাকলে Firebase থেকে আনে।
+
+    Admin Panel থেকে balance/points বদলালে
+    সেখানে adminEditedAt timestamp লেখা হয়।
+    Cache-এর data-তে সেই timestamp নতুন থাকলে
+    cache bypass করে fresh data আনে।
     """
     cached = cache_get_user(uid)
     if cached is not None:
-        log.debug(f"Cache HIT: {uid}")
-        return cached
+        # Admin Panel থেকে edit হয়েছে কিনা চেক করো
+        # (শুধু adminEditedAt field টা আনো — ছোট read)
+        try:
+            remote_ts = fb_get(f"users/{uid}/adminEditedAt") or 0
+            cached_ts = cached.get("adminEditedAt", 0)
+            if remote_ts > cached_ts:
+                # Admin edit আছে — cache মুছে fresh আনো
+                cache_invalidate_user(uid)
+                log.debug(f"Admin edit detected for {uid}, cache bypassed")
+            else:
+                log.debug(f"Cache HIT: {uid}")
+                return cached
+        except Exception:
+            return cached   # চেক ব্যর্থ হলে cache-ই দাও
+
     log.debug(f"Cache MISS: {uid}  → Firebase read")
     data = fb_get(f"users/{uid}")                  # ← সরাসরি Firebase
     if data:
@@ -533,14 +550,57 @@ async def _show_home(message, uid, user, s):
 @dp.message_handler(state=Reg.phone)
 async def reg_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
-    if len(phone) != 11 or not phone.isdigit():
-        await message.answer("❌ সঠিক ১১ সংখ্যার ফোন নম্বর দিন:")
+
+    # ── ফরম্যাট চেক ──
+    if not phone.isdigit():
+        await message.answer(
+            "❌ ফোন নম্বরে শুধু সংখ্যা থাকবে, কোনো স্পেস বা '-' নয়।\n"
+            "উদাহরণ: <code>01712345678</code>"
+        )
         return
-    # Check duplicate phone
+    if len(phone) != 11:
+        await message.answer(
+            f"❌ ফোন নম্বর ঠিক ১১ সংখ্যার হতে হবে।\n"
+            f"আপনি দিয়েছেন {len(phone)} সংখ্যা।\n"
+            f"উদাহরণ: <code>01712345678</code>"
+        )
+        return
+    if not phone.startswith("01"):
+        await message.answer(
+            "❌ বাংলাদেশের নম্বর <b>01</b> দিয়ে শুরু হওয়া উচিত।\n"
+            "উদাহরণ: <code>01712345678</code>"
+        )
+        return
+    valid_prefixes = ("011","013","014","015","016","017","018","019")
+    if not any(phone.startswith(p) for p in valid_prefixes):
+        await message.answer(
+            "❌ সঠিক অপারেটর কোড দিন (011-019)।\n"
+            "উদাহরণ: <code>01712345678</code>"
+        )
+        return
+
+    # ── Duplicate চেক ──
     users = fb_get("users") or {}
-    if any(u.get("phone") == phone for u in users.values()):
-        await message.answer("❌ এই ফোন নম্বরে আগেই অ্যাকাউন্ট আছে! অন্য নম্বর দিন:")
+    existing = next((u for u in users.values() if u.get("phone") == phone), None)
+    if existing:
+        st = existing.get("status", "pending")
+        if st == "active":
+            await message.answer(
+                "❌ এই ফোন নম্বরে আগেই একটি একটিভ অ্যাকাউন্ট আছে।\n"
+                "লগইন করতে /start দিন।"
+            )
+        elif st in ("pending", "review", "new"):
+            await message.answer(
+                "⚠️ এই ফোন নম্বরে একটি অ্যাকাউন্ট পেমেন্ট ভেরিফিকেশনের অপেক্ষায় আছে।\n"
+                "স্ট্যাটাস দেখতে /status দিন।"
+            )
+        else:
+            await message.answer(
+                "❌ এই ফোন নম্বর দিয়ে অ্যাকাউন্ট তৈরি করা যাবে না।\n"
+                "সাপোর্টে যোগাযোগ করুন: /support"
+            )
         return
+
     await state.update_data(phone=phone)
     await Reg.ref_code.set()
     await message.answer(
@@ -677,6 +737,20 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         await message.answer(err_msg)
         return
 
+    # ── Duplicate TxnID চেক ──
+    all_vers = fb_get("verifications") or {}
+    txn_upper = txn.upper()
+    is_duplicate = any(
+        v.get("transactionId", "").upper() == txn_upper
+        for v in all_vers.values()
+    )
+    if is_duplicate:
+        await message.answer(
+            "❌ এই ট্রান্জেকশন আইডিটি আগেই ব্যবহার করা হয়েছে।\n"
+            "সঠিক TxnID দিন বা সাপোর্টে যোগাযোগ করুন: /support"
+        )
+        return
+
     user = get_user(uid) or {}
     s    = get_settings()
 
@@ -734,6 +808,12 @@ async def cb_approve_ver(call: types.CallbackQuery):
     update_user(uid, {"status": "active", "verifiedAt": int(time.time() * 1000)})
     if vid:
         fb_update(f"verifications/{vid}", {"status": "approved", "approvedAt": int(time.time() * 1000)})
+
+    # ── আজকের revenue আপডেট (approve করার সময়ের ফি দিয়ে) ──
+    today_key  = datetime.now().strftime("%Y-%m-%d")
+    fee_now    = s.get("fee", 50)
+    prev_rev   = fb_get(f"dailyRevenue/{today_key}") or 0
+    fb_put(f"dailyRevenue/{today_key}", prev_rev + fee_now)
 
     # Credit referrer
     user = get_user(uid) or {}
