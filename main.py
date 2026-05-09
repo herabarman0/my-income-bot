@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 # ╔══════════════════════════════════════════════════════╗
 # ║          IncomeApp — Telegram Bot (main.py)          ║
-# ║   Firebase Realtime DB  ·  Admin Panel Compatible    ║
+# ║   Firebase Admin SDK  ·  Admin Panel Compatible      ║
 # ╚══════════════════════════════════════════════════════╝
 
 import logging
 import os
+import json
 import asyncio
-import requests
 import time
 import random
 import string
@@ -23,6 +23,8 @@ from aiogram.types import (
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+import firebase_admin
+from firebase_admin import credentials, db as fdb
 
 # ═══════════════════════════════════════════════════════
 #   KEEP-ALIVE  (Replit / Render)
@@ -43,10 +45,15 @@ def keep_alive():
 
 # ═══════════════════════════════════════════════════════
 #   CONFIGURATION
+#   Render Secret Files-এ এই তিনটো key যোগ করুন:
+#     BOT_TOKEN      → BotFather-এর token
+#     ADMIN_ID       → আপনার Telegram numeric ID
+#     FIREBASE_URL   → https://your-app-default-rtdb.firebaseio.com
+#     FIREBASE_KEYS  → Service Account JSON-এর পুরো কন্টেন্ট
 # ═══════════════════════════════════════════════════════
-API_TOKEN      = os.getenv('BOT_TOKEN', '')
-ADMIN_ID       = int(os.getenv('ADMIN_ID', '0'))
-FIREBASE_URL   = os.getenv('FIREBASE_URL', 'https://incomeapp-947c9-default-rtdb.firebaseio.com')
+API_TOKEN    = os.getenv('BOT_TOKEN', '')
+ADMIN_ID     = int(os.getenv('ADMIN_ID', '0'))
+FIREBASE_URL = os.getenv('FIREBASE_URL', '')
 
 storage = MemoryStorage()
 bot     = Bot(token=API_TOKEN, parse_mode="HTML")
@@ -55,42 +62,111 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log     = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════
-#   FIREBASE HELPERS
+#   FIREBASE ADMIN SDK — SECURE INITIALIZATION
+#
+#   Render → Environment Variables-এ দিন:
+#     FIREBASE_URL   = https://xxxx-default-rtdb.firebaseio.com
+#     FIREBASE_KEYS  = { Service Account JSON-এর পুরো কন্টেন্ট }
+#
+#   Firebase Console → Project Settings →
+#   Service Accounts → Generate New Private Key
+#   ডাউনলোড করা JSON ফাইলের ভেতরের সব কিছু কপি করুন।
+#
+#   Firebase Rules এখন নিরাপদভাবে এভাবে দিন:
+#   {
+#     "rules": {
+#       ".read":  false,
+#       ".write": false
+#     }
+#   }
+#   Admin SDK এই rules বাইপাস করে কাজ করে। ✅
+# ═══════════════════════════════════════════════════════
+_firebase_keys_raw = os.getenv('FIREBASE_KEYS', '')
+
+if _firebase_keys_raw and FIREBASE_URL:
+    try:
+        _cred_dict = json.loads(_firebase_keys_raw)
+        _cred      = credentials.Certificate(_cred_dict)
+        firebase_admin.initialize_app(_cred, {'databaseURL': FIREBASE_URL})
+        log.info("✅ Firebase Admin SDK initialized")
+    except Exception as _e:
+        log.error(f"❌ Firebase init error: {_e}")
+else:
+    log.error("❌ FIREBASE_KEYS বা FIREBASE_URL পাওয়া যায়নি!")
+
+# ═══════════════════════════════════════════════════════
+#   FIREBASE HELPERS  (Admin SDK version)
 # ═══════════════════════════════════════════════════════
 def fb_get(path: str):
     try:
-        r = requests.get(f"{FIREBASE_URL}/{path}.json", timeout=8)
-        return r.json()
+        return fdb.reference(path).get()
     except Exception as e:
         log.error(f"fb_get error [{path}]: {e}")
         return None
 
 def fb_put(path: str, data):
     try:
-        requests.put(f"{FIREBASE_URL}/{path}.json", json=data, timeout=8)
+        fdb.reference(path).set(data)
     except Exception as e:
         log.error(f"fb_put error [{path}]: {e}")
 
-def fb_update(path: str, data):
+def fb_update(path: str, data: dict):
     try:
-        requests.patch(f"{FIREBASE_URL}/{path}.json", json=data, timeout=8)
+        fdb.reference(path).update(data)
     except Exception as e:
         log.error(f"fb_update error [{path}]: {e}")
 
-def fb_push(path: str, data):
-    """Adds a new child node (like Firebase push)"""
+def fb_push(path: str, data: dict):
     try:
-        r = requests.post(f"{FIREBASE_URL}/{path}.json", json=data, timeout=8)
-        return r.json().get('name')
+        new_ref = fdb.reference(path).push(data)
+        return new_ref.key
     except Exception as e:
         log.error(f"fb_push error [{path}]: {e}")
         return None
 
 def fb_delete(path: str):
     try:
-        requests.delete(f"{FIREBASE_URL}/{path}.json", timeout=8)
+        fdb.reference(path).delete()
     except Exception as e:
         log.error(f"fb_delete error [{path}]: {e}")
+
+def fb_txn_add(uid: str, balance_delta: float = 0, points_delta: int = 0) -> bool:
+    """
+    Race Condition-safe balance ও points আপডেট।
+
+    Firebase transaction ব্যবহার করে — একই সময়ে
+    দুটো আপডেট এলে একটা retry করে, কোনো ডেটা হারায় না।
+
+    শুধু balance বা points বদলানোর দরকার হলে
+    বাকিটা 0 রাখুন।
+
+    Returns True if successful, False otherwise.
+    """
+    if balance_delta == 0 and points_delta == 0:
+        return True
+    try:
+        ref = fdb.reference(f"users/{uid}")
+
+        def _txn_fn(current_data):
+            if current_data is None:
+                return None                            # ইউজার নেই — abort
+            if balance_delta != 0:
+                current_data["balance"] = round(
+                    max(0, current_data.get("balance", 0) + balance_delta), 2
+                )
+            if points_delta != 0:
+                current_data["points"] = max(
+                    0, current_data.get("points", 0) + points_delta
+                )
+            return current_data
+
+        result = ref.transaction(_txn_fn)
+        cache_invalidate_user(uid)                     # ক্যাশ মুছো
+        log.debug(f"txn_add uid={uid} bal={balance_delta:+} pts={points_delta:+}")
+        return result is not None
+    except Exception as e:
+        log.error(f"fb_txn_add error uid={uid}: {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════
 #   LOCAL CACHE  (RAM — no TTL, invalidate-on-write)
@@ -101,23 +177,35 @@ def fb_delete(path: str):
 #   পরের রিড-এ নতুন ডেটা Firebase থেকে আসে
 #   এবং আবার ক্যাশে জমা হয়।
 # ═══════════════════════════════════════════════════════
-_user_cache: dict = {}   # { uid: user_dict }
+
+# ── ইউজার ক্যাশ ──
+MAX_CACHE_SIZE = 2000          # সর্বোচ্চ ২০০০ ইউজার RAM-এ থাকবে
+_user_cache: dict = {}         # { uid: user_dict }
 
 def cache_get_user(uid: str):
     """RAM থেকে ইউজার ডেটা দাও। না থাকলে None।"""
     return _user_cache.get(uid)
 
 def cache_set_user(uid: str, data: dict):
-    """RAM-এ ইউজার ডেটা রাখো।"""
-    if data:
-        _user_cache[uid] = dict(data)   # shallow copy
+    """
+    RAM-এ ইউজার ডেটা রাখো।
+    ক্যাশ ভরে গেলে সবচেয়ে পুরনো ১০% মুছে দাও।
+    """
+    if not data:
+        return
+    if len(_user_cache) >= MAX_CACHE_SIZE:
+        remove_count = MAX_CACHE_SIZE // 10        # ২০০ টা মুছবে
+        for key in list(_user_cache.keys())[:remove_count]:
+            del _user_cache[key]
+        log.debug(f"Cache evicted {remove_count} entries (size limit)")
+    _user_cache[uid] = dict(data)                  # shallow copy
 
 def cache_invalidate_user(uid: str):
     """ইউজারের ক্যাশ মুছে ফেলো (ডেটা পরিবর্তন হলে)।"""
     _user_cache.pop(uid, None)
     log.debug(f"Cache invalidated: {uid}")
 
-# ── cached user fetch (drop-in replacement for fb_get("users/uid")) ──
+# ── cached user fetch ──
 def get_user(uid: str) -> dict | None:
     """
     প্রথমে RAM চেক করে। না থাকলে Firebase থেকে আনে
@@ -128,7 +216,7 @@ def get_user(uid: str) -> dict | None:
         log.debug(f"Cache HIT: {uid}")
         return cached
     log.debug(f"Cache MISS: {uid}  → Firebase read")
-    data = fb_get(f"users/{uid}")   # ← সরাসরি Firebase
+    data = fb_get(f"users/{uid}")                  # ← সরাসরি Firebase
     if data:
         cache_set_user(uid, data)
     return data
@@ -136,20 +224,38 @@ def get_user(uid: str) -> dict | None:
 # ── cache-aware write helpers ──
 def update_user(uid: str, fields: dict):
     """Firebase আপডেট করে, তারপর ক্যাশ invalidate করে।"""
-    fb_update(f"users/{uid}", fields)   # ← সরাসরি Firebase
+    fb_update(f"users/{uid}", fields)              # ← সরাসরি Firebase
     cache_invalidate_user(uid)
 
 def put_user(uid: str, data: dict):
     """Firebase-এ নতুন ইউজার রাখে, তারপর ক্যাশ সেট করে।"""
     fb_put(f"users/{uid}", data)
-    cache_set_user(uid, data)   # নতুন ডেটাই ক্যাশে রাখো
+    cache_set_user(uid, data)                      # নতুন ডেটাই ক্যাশে রাখো
 
 # ═══════════════════════════════════════════════════════
-#   SETTINGS HELPER
+#   SETTINGS CACHE  (TTL-based — ৬০ সেকেন্ড পর refresh)
+#
+#   settings সবার জন্য একই — তাই একটাই ক্যাশ।
+#   প্রতি ৬০ সেকেন্ডে একবার Firebase থেকে আনে।
+#   ৫০,০০০ ইউজার active থাকলেও settings-এর
+#   Firebase read প্রতি মিনিটে মাত্র ১ বার।
 # ═══════════════════════════════════════════════════════
+SETTINGS_TTL                  = 60                # সেকেন্ড
+_settings_cache: dict         = {"data": None, "ts": 0.0}
+
 def get_settings() -> dict:
+    """
+    ৬০ সেকেন্ডের মধ্যে একাধিক call হলে
+    Firebase-এ না গিয়ে RAM থেকে দেয়।
+    """
+    now = time.time()
+    if _settings_cache["data"] and (now - _settings_cache["ts"]) < SETTINGS_TTL:
+        log.debug("Settings cache HIT")
+        return _settings_cache["data"]
+
+    log.debug("Settings cache MISS → Firebase read")
     s = fb_get("settings") or {}
-    return {
+    result = {
         "bkash":      s.get("bkash",      "01XXXXXXXXX"),
         "nagad":      s.get("nagad",      "01XXXXXXXXX"),
         "fee":        s.get("fee",        50),
@@ -164,6 +270,18 @@ def get_settings() -> dict:
         "earn3":      s.get("earn3",      30),
         "dailyBonus": s.get("dailyBonus", 5),
     }
+    _settings_cache["data"] = result
+    _settings_cache["ts"]   = now
+    return result
+
+def invalidate_settings_cache():
+    """
+    প্রয়োজনে manually settings cache মুছতে।
+    সাধারণত TTL-ই যথেষ্ট।
+    """
+    _settings_cache["data"] = None
+    _settings_cache["ts"]   = 0.0
+    log.debug("Settings cache invalidated")
 
 # ═══════════════════════════════════════════════════════
 #   LEVEL & EARN LOGIC
@@ -622,14 +740,9 @@ async def cb_approve_ver(call: types.CallbackQuery):
     ref_uid = user.get("referredBy")
     if ref_uid:
         ref_user = get_user(ref_uid) or {}
-        ref_pts  = ref_user.get("points", 0)
-        ref_bal  = ref_user.get("balance", 0)
-        lvl      = get_level(ref_pts, s)
+        lvl      = get_level(ref_user.get("points", 0), s)
         earn     = get_earn(lvl, s)
-        update_user(ref_uid, {
-            "balance": ref_bal + earn,
-            "points":  ref_pts + earn,
-        })
+        fb_txn_add(ref_uid, balance_delta=earn, points_delta=earn)  # ← race-safe
         try:
             await bot.send_message(
                 int(ref_uid),
@@ -798,11 +911,9 @@ async def menu_handler(message: types.Message, state: FSMContext):
                 f"কাল আবার আসুন! ⏰"
             )
         else:
+            fb_txn_add(uid, points_delta=bonus)        # ← race-safe
+            update_user(uid, {"lastDailyBonus": int(time.time() * 1000)})
             new_pts = user.get("points", 0) + bonus
-            update_user(uid, {
-                "points":         new_pts,
-                "lastDailyBonus": int(time.time() * 1000),
-            })
             await message.answer(
                 f"🎁 <b>ডেইলি বোনাস পেয়েছেন!</b>\n\n"
                 f"✅ +{bonus} পয়েন্ট আপনার একাউন্টে যোগ হয়েছে।\n"
@@ -886,15 +997,20 @@ async def menu_handler(message: types.Message, state: FSMContext):
     elif txt == "🚨 রিপোর্ট করুন":
         last_report = user.get("lastReport", 0)
         if (time.time() * 1000) - last_report < 86_400_000:
+            # কখন পাঠাতে পারবে হিসাব করে দেখাও
+            remaining_ms  = 86_400_000 - ((time.time() * 1000) - last_report)
+            remaining_hrs = int(remaining_ms / 3_600_000)
+            remaining_min = int((remaining_ms % 3_600_000) / 60_000)
             await message.answer(
-                "⚠️ ২৪ ঘণ্টায় মাত্র একটি রিপোর্ট করা যাবে।\n"
-                "কাল আবার চেষ্টা করুন।"
+                f"⚠️ ২৪ ঘণ্টায় মাত্র একটি রিপোর্ট করা যাবে।\n"
+                f"⏰ আরও {remaining_hrs} ঘণ্টা {remaining_min} মিনিট পর পাঠাতে পারবেন।"
             )
             return
         await Report.message.set()
         await message.answer(
             "🚨 <b>সমস্যা রিপোর্ট করুন</b>\n\n"
-            "আপনার সমস্যাটি বিস্তারিত লিখুন:\n"
+            "আপনার সমস্যাটি সংক্ষেপে লিখুন:\n"
+            "⚠️ সর্বোচ্চ <b>২৫০ অক্ষর</b>\n"
             "(বাতিল করতে /cancel লিখুন)"
         )
 
@@ -1007,10 +1123,9 @@ async def cb_mark_paid(call: types.CallbackQuery):
         return
 
     fb_update(f"withdrawals/{wid}", {"status": "success", "paidAt": int(time.time() * 1000)})
-    uid  = w.get("uid")
-    user = get_user(uid) or {}
-    new_bal = max(0, user.get("balance", 0) - float(w.get("amount", 0)))
-    update_user(uid, {"balance": new_bal})
+    uid     = w.get("uid")
+    amount  = float(w.get("amount", 0))
+    fb_txn_add(uid, balance_delta=-amount)             # ← race-safe বিয়োগ
 
     try:
         await bot.send_message(
@@ -1040,10 +1155,10 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
         return
 
     fb_update(f"withdrawals/{wid}", {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
-    # Refund
-    uid  = w.get("uid")
-    user = get_user(uid) or {}
-    update_user(uid, {"balance": user.get("balance", 0) + float(w.get("amount", 0))})
+    # Refund — race-safe যোগ
+    uid    = w.get("uid")
+    amount = float(w.get("amount", 0))
+    fb_txn_add(uid, balance_delta=+amount)             # ← race-safe রিফান্ড
 
     try:
         await bot.send_message(
@@ -1063,37 +1178,78 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
 # ═══════════════════════════════════════════════════════
 #   REPORT FLOW
 # ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+#   REPORT — AUTO DELETE AFTER 5 SECONDS
+# ═══════════════════════════════════════════════════════
+async def _auto_delete_report(rid: str):
+    """
+    Telegram-এ পাঠানোর ৫ সেকেন্ড পর
+    Firebase-এর reports নোড থেকে মুছে দেয়।
+    Admin Panel-এ ৫ সেকেন্ডের জন্য দেখা যাবে,
+    তারপর চলে যাবে।
+    """
+    await asyncio.sleep(5)
+    fb_delete(f"reports/{rid}")
+    log.debug(f"Auto-deleted report: {rid}")
+
 @dp.message_handler(state=Report.message)
 async def report_message(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
     user = get_user(uid) or {}
 
-    fb_push("reports", {
-        "uid":       uid,
-        "name":      user.get("name", "?"),
-        "phone":     user.get("phone", "?"),
-        "message":   message.text,
-        "read":      False,
-        "createdAt": int(time.time() * 1000),
-    })
-    update_user(uid, {"lastReport": int(time.time() * 1000)})
-
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🚨 <b>নতুন রিপোর্ট</b>\n"
-            f"👤 {user.get('name','?')} | 📞 {user.get('phone','?')}\n"
-            f"UID: <code>{uid}</code>\n\n"
-            f"📝 {message.text}"
+    # ── ২৫০ অক্ষর সীমা ──
+    raw_text = message.text or ""
+    if len(raw_text) > 250:
+        await message.answer(
+            f"❌ রিপোর্ট সর্বোচ্চ ২৫০ অক্ষর হতে পারবে।\n"
+            f"আপনি লিখেছেন {len(raw_text)} অক্ষর।\n\n"
+            f"সংক্ষেপ করে আবার লিখুন:"
         )
-    except:
-        pass
+        return   # state এ থেকে যাবে — ইউজার আবার লিখতে পারবে
 
+    # ── ২৪ ঘণ্টা চেক (double check) ──
+    last_report = user.get("lastReport", 0)
+    if (time.time() * 1000) - last_report < 86_400_000:
+        await state.finish()
+        await message.answer("⚠️ ২৪ ঘণ্টায় মাত্র একটি রিপোর্ট করা যাবে।",
+                             reply_markup=main_kb())
+        return
+
+    # ── lastReport আগেই সেট করো — spam block ──
+    update_user(uid, {"lastReport": int(time.time() * 1000)})
     await state.finish()
+
+    # ── Admin-কে Telegram নোটিফিকেশন ──
+    report_text = (
+        f"🚨 <b>নতুন রিপোর্ট</b>\n"
+        f"👤 {user.get('name','?')} | 📞 {user.get('phone','?')}\n"
+        f"🆔 UID: <code>{uid}</code>\n"
+        f"📝 {raw_text}"
+    )
+    try:
+        await bot.send_message(ADMIN_ID, report_text)
+    except Exception as e:
+        log.warning(f"Report notify error: {e}")
+
     await message.answer(
         "✅ <b>রিপোর্ট পাঠানো হয়েছে।</b>\n\nঅ্যাডমিন শীঘ্রই ব্যবস্থা নেবেন।",
         reply_markup=main_kb()
     )
+
+    # ── ৫ সেকেন্ড পর DB থেকে auto-delete ──
+    # (reports নোড-এ সেভ হয় না — শুধু Telegram-এ পাঠানো হয়)
+    # কিন্তু যদি Admin Panel-এর জন্য সেভ করতেই চান,
+    # তাহলে নিচের কোড ব্যবহার করুন — ৫ সেকেন্ড পর মুছে যাবে:
+    rid = fb_push("reports", {
+        "uid":       uid,
+        "name":      user.get("name", "?"),
+        "phone":     user.get("phone", "?"),
+        "message":   raw_text,
+        "createdAt": int(time.time() * 1000),
+    })
+    if rid:
+        # asyncio task — ৫ সেকেন্ড অপেক্ষা করে তারপর মুছে দেয়
+        asyncio.get_event_loop().create_task(_auto_delete_report(rid))
 
 # ═══════════════════════════════════════════════════════
 #   ADMIN MENU HANDLERS
@@ -1277,7 +1433,12 @@ async def cmd_report(message: types.Message, state: FSMContext):
         await message.answer("⚠️ ২৪ ঘণ্টায় মাত্র একটি রিপোর্ট করা যাবে।")
         return
     await Report.message.set()
-    await message.answer("📝 আপনার সমস্যা লিখুন:")
+    await message.answer(
+        "🚨 <b>সমস্যা রিপোর্ট করুন</b>\n\n"
+        "আপনার সমস্যাটি সংক্ষেপে লিখুন:\n"
+        "⚠️ সর্বোচ্চ <b>২৫০ অক্ষর</b>\n"
+        "(বাতিল করতে /cancel লিখুন)"
+    )
 
 @dp.message_handler(commands=['cancel'], state="*")
 async def cmd_cancel(message: types.Message, state: FSMContext):
