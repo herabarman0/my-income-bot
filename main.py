@@ -1202,20 +1202,19 @@ async def cb_mark_paid(call: types.CallbackQuery):
         await call.answer("রিকোয়েস্ট পাওয়া যায়নি!", show_alert=True)
         return
 
+    # ── Double payment আটকাও ──
+    if w.get("status") == "success":
+        await call.answer("এটা আগেই পেমেন্ট হয়ে গেছে!", show_alert=True)
+        return
+
+    uid    = w.get("uid")
+    amount = float(w.get("amount", 0))
+
     fb_update(f"withdrawals/{wid}", {"status": "success", "paidAt": int(time.time() * 1000)})
-    uid     = w.get("uid")
-    amount  = float(w.get("amount", 0))
     fb_txn_add(uid, balance_delta=-amount)             # ← race-safe বিয়োগ
 
-    try:
-        await bot.send_message(
-            int(uid),
-            f"✅ <b>পেমেন্ট সম্পন্ন হয়েছে!</b>\n\n"
-            f"💰 ৳{w.get('amount')} আপনার {w.get('method','?').upper()} নম্বরে পাঠানো হয়েছে।\n"
-            f"📱 নম্বর: {w.get('number','?')}"
-        )
-    except:
-        pass
+    # ── ইউজারকে notification ──
+    await _notify_user_paid(uid, w)
 
     await call.message.edit_text(
         call.message.text + f"\n\n✅ <b>PAID</b> — {datetime.now().strftime('%H:%M')}"
@@ -1240,15 +1239,7 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
     amount = float(w.get("amount", 0))
     fb_txn_add(uid, balance_delta=+amount)             # ← race-safe রিফান্ড
 
-    try:
-        await bot.send_message(
-            int(uid),
-            f"❌ <b>উত্তোলনের আবেদন বাতিল হয়েছে।</b>\n\n"
-            f"৳{w.get('amount')} আপনার ব্যালেন্সে ফেরত দেওয়া হয়েছে।\n"
-            f"সমস্যায় /support লিখুন।"
-        )
-    except:
-        pass
+    await _notify_user_rejected(uid, w)
 
     await call.message.edit_text(
         call.message.text + f"\n\n❌ <b>REJECTED</b> — {datetime.now().strftime('%H:%M')}"
@@ -1259,8 +1250,61 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
 #   REPORT FLOW
 # ═══════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════
-#   REPORT — AUTO DELETE AFTER 5 SECONDS
+#   WITHDRAWAL NOTIFICATION HELPERS
 # ═══════════════════════════════════════════════════════
+async def _notify_user_paid(uid: str, w: dict):
+    """ইউজারকে পেমেন্ট সম্পন্নের message পাঠাও।"""
+    try:
+        await bot.send_message(
+            int(uid),
+            f"✅ <b>পেমেন্ট সম্পন্ন হয়েছে!</b>\n\n"
+            f"💰 ৳{w.get('amount')} আপনার "
+            f"{w.get('method','?').upper()} নম্বরে পাঠানো হয়েছে।\n"
+            f"📱 নম্বর: {w.get('number','?')}"
+        )
+        log.info(f"Paid notification sent to {uid}")
+    except Exception as e:
+        log.warning(f"Paid notify error uid={uid}: {e}")
+
+async def _notify_user_rejected(uid: str, w: dict):
+    """ইউজারকে withdrawal reject message পাঠাও।"""
+    try:
+        await bot.send_message(
+            int(uid),
+            f"❌ <b>উত্তোলনের আবেদন বাতিল হয়েছে।</b>\n\n"
+            f"৳{w.get('amount')} আপনার ব্যালেন্সে ফেরত দেওয়া হয়েছে।\n"
+            f"সমস্যায় /support লিখুন।"
+        )
+    except Exception as e:
+        log.warning(f"Reject notify error uid={uid}: {e}")
+
+async def watch_admin_paid_notifications():
+    """
+    Admin Panel থেকে 'Mark as Paid' করলে
+    withdrawal-এ adminPaidNotify field লেখা হয়।
+    এই watcher সেটা দেখে ইউজারকে Telegram message পাঠায়।
+
+    প্রতি ৮ সেকেন্ডে একবার চেক করে — দিনে ~১০,৮০০ read।
+    শুধু pending→success হওয়া records দেখে।
+    """
+    notified_wids: set = set()              # একই wid দুইবার notify না করতে
+    while True:
+        try:
+            withdrawals = fb_get("withdrawals") or {}
+            for wid, w in withdrawals.items():
+                if wid in notified_wids:
+                    continue
+                # adminPaidNotify আছে মানে Admin Panel থেকে approve হয়েছে
+                notify_uid = w.get("adminPaidNotify")
+                if notify_uid and w.get("status") == "success":
+                    await _notify_user_paid(notify_uid, w)
+                    # field মুছে দাও — আর process না হোক
+                    fb_update(f"withdrawals/{wid}", {"adminPaidNotify": None})
+                    notified_wids.add(wid)
+                    log.info(f"Admin panel paid notify sent: wid={wid} uid={notify_uid}")
+        except Exception as e:
+            log.debug(f"watch_admin_paid_notifications error: {e}")
+        await asyncio.sleep(8)
 async def _auto_delete_report(rid: str):
     """
     Telegram-এ পাঠানোর ৫ সেকেন্ড পর
@@ -1546,4 +1590,6 @@ async def fallback(message: types.Message, state: FSMContext):
 if __name__ == '__main__':
     keep_alive()
     log.info("IncomeApp Bot starting...")
-    executor.start_polling(dp, skip_updates=True)
+    loop = asyncio.get_event_loop()
+    loop.create_task(watch_admin_paid_notifications())
+    executor.start_polling(dp, skip_updates=True, loop=loop)
