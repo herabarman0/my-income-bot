@@ -269,7 +269,7 @@ def get_settings() -> dict:
         "earn1":      s.get("earn1",      20),
         "earn2":      s.get("earn2",      25),
         "earn3":      s.get("earn3",      30),
-        "dailyBonus": s.get("dailyBonus", 10),
+        "dailyBonus": s.get("dailyBonus", 10),   # ← ডেইলি বোনাস ডিফল্ট ১০ পয়েন্ট (এখানে বদলান)
     }
     _settings_cache["data"] = result
     _settings_cache["ts"]   = now
@@ -307,8 +307,13 @@ def generate_refer_code(name: str) -> str:
     return prefix + suffix
 
 def is_refer_code_unique(code: str) -> bool:
-    users = fb_get("users") or {}
-    return not any(u.get("referCode") == code for u in users.values())
+    """Firebase indexed query — পুরো users লোড করে না।"""
+    try:
+        result = fdb.reference("users").order_by_child("referCode").equal_to(code).get()
+        return not result   # খালি মানে unique
+    except Exception as e:
+        log.error(f"is_refer_code_unique error: {e}")
+        return True         # error হলে unique ধরো
 
 def make_unique_refer_code(name: str) -> str:
     for _ in range(20):
@@ -448,10 +453,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
             return
         args = message.get_args()
         ref_by = args if args else None
-        # Verify ref code exists
+        # Verify ref code exists — indexed query, পুরো users লোড করে না
         if ref_by:
-            users_all = fb_get("users") or {}
-            if not any(u.get("referCode") == ref_by for u in users_all.values()):
+            try:
+                match = fdb.reference("users").order_by_child("referCode").equal_to(ref_by).get()
+                if not match:
+                    ref_by = None
+            except Exception:
                 ref_by = None
 
         await state.update_data(referred_by=ref_by, name=message.from_user.full_name)
@@ -563,10 +571,13 @@ async def reg_phone(message: types.Message, state: FSMContext):
         )
         return
 
-    # ── Duplicate চেক ──
-    users = fb_get("users") or {}
-    existing = next((u for u in users.values() if u.get("phone") == phone), None)
-    if existing:
+    # ── Duplicate চেক — indexed query ──
+    try:
+        match_phone = fdb.reference("users").order_by_child("phone").equal_to(phone).get()
+    except Exception:
+        match_phone = None
+    if match_phone:
+        existing = list(match_phone.values())[0]
         st = existing.get("status", "pending")
         if st == "active":
             await message.answer(
@@ -600,23 +611,24 @@ async def reg_ref_code(message: types.Message, state: FSMContext):
 
     referred_by_uid = None
     if code != "SKIP" and code:
-        users_all = fb_get("users") or {}
-        match = next((k for k, v in users_all.items() if v.get("referCode") == code), None)
-        if match:
-            referred_by_uid = match
+        try:
+            match_ref = fdb.reference("users").order_by_child("referCode").equal_to(code).get()
+        except Exception:
+            match_ref = None
+        if match_ref:
+            referred_by_uid = list(match_ref.keys())[0]
         else:
             await message.answer("⚠️ রেফার কোড পাওয়া যায়নি। Skip করুন বা সঠিক কোড দিন:")
             return
 
     # Override from /start args if present
     if data.get("referred_by") and not referred_by_uid:
-        # referred_by is a referCode from start args
-        users_all = fb_get("users") or {}
-        match = next(
-            (k for k, v in users_all.items() if v.get("referCode") == data["referred_by"]),
-            None
-        )
-        referred_by_uid = match
+        try:
+            match_ref2 = fdb.reference("users").order_by_child("referCode").equal_to(data["referred_by"]).get()
+            if match_ref2:
+                referred_by_uid = list(match_ref2.keys())[0]
+        except Exception:
+            pass
 
     refer_code = make_unique_refer_code(data["name"])
 
@@ -721,14 +733,13 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         await message.answer(err_msg)
         return
 
-    # ── Duplicate TxnID চেক ──
-    all_vers = fb_get("verifications") or {}
+    # ── Duplicate TxnID চেক — indexed query, পুরো verifications লোড করে না ──
     txn_upper = txn.upper()
-    is_duplicate = any(
-        v.get("transactionId", "").upper() == txn_upper
-        for v in all_vers.values()
-    )
-    if is_duplicate:
+    try:
+        match_txn = fdb.reference("verifications").order_by_child("transactionId").equal_to(txn_upper).get()
+    except Exception:
+        match_txn = None
+    if match_txn:
         await message.answer(
             "❌ এই ট্রান্জেকশন আইডিটি আগেই ব্যবহার করা হয়েছে।\n"
             "সঠিক TxnID দিন বা সাপোর্টে যোগাযোগ করুন: /support"
@@ -793,6 +804,13 @@ async def cb_approve_ver(call: types.CallbackQuery):
     if vid:
         fb_update(f"verifications/{vid}", {"status": "approved", "approvedAt": int(time.time() * 1000)})
 
+    # ── stats counter +1 ──
+    try:
+        cur = fb_get("stats/active_users") or 0
+        fb_put("stats/active_users", cur + 1)
+    except Exception:
+        pass
+
     # ── আজকের revenue আপডেট (approve করার সময়ের ফি দিয়ে) ──
     today_key  = datetime.now().strftime("%Y-%m-%d")
     fee_now    = s.get("fee", 50)
@@ -806,14 +824,15 @@ async def cb_approve_ver(call: types.CallbackQuery):
         ref_user = get_user(ref_uid) or {}
         lvl      = get_level(ref_user.get("points", 0), s)
         earn     = get_earn(lvl, s)
-        fb_txn_add(ref_uid, balance_delta=earn, points_delta=100)  # ← race-safe
+        REF_POINTS = 100   # ← প্রতি রেফারে ১০০ পয়েন্ট (এখানে বদলান)
+        fb_txn_add(ref_uid, balance_delta=earn, points_delta=REF_POINTS)  # ← race-safe
         try:
             await bot.send_message(
                 int(ref_uid),
                 f"🎊 <b>রেফার বোনাস পেয়েছেন!</b>\n\n"
                 f"আপনার রেফার করা বন্ধু একটিভ হয়েছেন।\n"
                 f"💰 আপনার ব্যালেন্সে <b>৳{earn}</b> যোগ হয়েছে!\n"
-                f"🎯 পয়েন্ট: +100"
+                f"🎯 পয়েন্ট: +{REF_POINTS}"
             )
         except:
             pass
@@ -909,10 +928,13 @@ async def menu_handler(message: types.Message, state: FSMContext):
         earn = get_earn(lvl, s)
         minw = get_min_withdraw(lvl)
 
-        # Refer stats
-        all_users    = fb_get("users") or {}
-        total_refs   = sum(1 for u in all_users.values() if u.get("referredBy") == uid)
-        active_refs  = sum(1 for u in all_users.values() if u.get("referredBy") == uid and u.get("status") == "active")
+        # Refer stats — indexed query
+        try:
+            ref_matches = fdb.reference("users").order_by_child("referredBy").equal_to(uid).get() or {}
+        except Exception:
+            ref_matches = {}
+        total_refs  = len(ref_matches)
+        active_refs = sum(1 for u in ref_matches.values() if u.get("status") == "active")
 
         me       = await bot.get_me()
         ref_link = f"https://t.me/{me.username}?start={user.get('referCode','')}"
@@ -1385,22 +1407,24 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
     # ── ড্যাশবোর্ড ──
     if "📊 ড্যাশবোর্ড" in txt:
-        users  = fb_get("users") or {}
+        # total & active — shallow read + stored counter (পুরো users লোড করে না)
+        try:
+            users_snap = fdb.reference("users").get(shallow=True)
+            total    = len(users_snap) if users_snap else 0
+            active_u = fb_get("stats/active_users") or "?"
+        except Exception:
+            total, active_u = "?", "?"
+
         vers   = fb_get("verifications") or {}
-        withs  = fb_get("withdrawals") or {}
+        withs  = fb_get("withdrawals")   or {}
         s      = get_settings()
 
-        total      = len(users)
-        active_u   = sum(1 for u in users.values() if u.get("status") == "active")
-        ver_pend   = sum(1 for v in vers.values()  if v.get("status") in ("pending","review"))
-        wit_pend   = sum(1 for w in withs.values() if w.get("status") == "pending")
+        ver_pend = sum(1 for v in vers.values() if v.get("status") in ("pending","review"))
+        wit_pend = sum(1 for w in withs.values() if w.get("status") == "pending")
 
-        today = date.today().isoformat()
-        rev   = sum(
-            s["fee"] for u in users.values()
-            if u.get("verifiedAt") and
-            datetime.fromtimestamp(u["verifiedAt"] / 1000).date().isoformat() == today
-        )
+        # Revenue — stored value (approve করার সময় সেভ হয়)
+        today_key = date.today().strftime("%Y-%m-%d")
+        rev       = fb_get(f"dailyRevenue/{today_key}") or 0
 
         await message.answer(
             f"📊 <b>লাইভ ড্যাশবোর্ড</b>\n"
@@ -1495,23 +1519,42 @@ async def admin_handler(message: types.Message, state: FSMContext):
 async def admin_broadcast(message: types.Message, state: FSMContext):
     notice_text = message.text
     await state.finish()
-    users = fb_get("users") or {}
-    await message.answer(f"⏳ {len(users)} জনের কাছে পাঠানো হচ্ছে...")
+
+    # শুধু UID keys আনো — পুরো profile data নয় (memory safe)
+    try:
+        users_snap = fdb.reference("users").get(shallow=True) or {}
+    except Exception as e:
+        await message.answer(f"❌ ইউজার তালিকা আনতে সমস্যা: {e}", reply_markup=admin_kb())
+        return
+
+    uid_list   = list(users_snap.keys())
+    total_users = len(uid_list)
+    await message.answer(f"⏳ {bn(total_users)} জনের কাছে পাঠানো শুরু হচ্ছে...")
 
     sent = 0
-    for uid_str in users:
-        try:
-            await bot.send_message(
-                int(uid_str),
-                f"📢 <b>নতুন আপডেট:</b>\n\n{notice_text}"
-            )
-            sent += 1
-            await asyncio.sleep(0.05)
-        except:
-            pass
+    failed = 0
+    # ১০০০ জন করে batch — RAM নিরাপদ থাকবে
+    BATCH = 1000
+    for i in range(0, total_users, BATCH):
+        batch = uid_list[i:i + BATCH]
+        for uid_str in batch:
+            try:
+                await bot.send_message(
+                    int(uid_str),
+                    f"📢 <b>নতুন আপডেট:</b>\n\n{notice_text}"
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)   # Telegram rate limit: 20 msg/sec
+        # প্রতি batch-এর পর ৫ সেকেন্ড বিরতি
+        if i + BATCH < total_users:
+            await asyncio.sleep(5)
 
     await message.answer(
-        f"✅ সফলভাবে {bn(sent)} জনের কাছে পাঠানো হয়েছে।",
+        f"✅ ব্রডকাস্ট সম্পন্ন!\n"
+        f"📤 পাঠানো হয়েছে: {bn(sent)} জন\n"
+        f"❌ ব্যর্থ: {bn(failed)} জন",
         reply_markup=admin_kb()
     )
 
@@ -1585,6 +1628,37 @@ async def fallback(message: types.Message, state: FSMContext):
 if __name__ == '__main__':
     keep_alive()
     log.info("IncomeApp Bot starting...")
+
+    WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL', '')     # Render দেয় automatically
+    WEBHOOK_PATH = f"/webhook/{API_TOKEN}"
+    WEBHOOK_URL  = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
     loop = asyncio.get_event_loop()
     loop.create_task(watch_admin_paid_notifications())
-    executor.start_polling(dp, skip_updates=True, loop=loop)
+
+    if WEBHOOK_HOST:
+        # ── WEBHOOK (Production — Render) ──
+        log.info(f"Starting webhook: {WEBHOOK_URL}")
+        from aiogram.utils.executor import start_webhook
+
+        async def on_startup(dp):
+            await bot.set_webhook(WEBHOOK_URL)
+            log.info("Webhook set ✅")
+
+        async def on_shutdown(dp):
+            await bot.delete_webhook()
+            log.info("Webhook deleted")
+
+        start_webhook(
+            dispatcher   = dp,
+            webhook_path = WEBHOOK_PATH,
+            on_startup   = on_startup,
+            on_shutdown  = on_shutdown,
+            skip_updates = True,
+            host         = "0.0.0.0",
+            port         = int(os.getenv("PORT", 8080)),
+        )
+    else:
+        # ── POLLING (Local development) ──
+        log.info("No RENDER_EXTERNAL_URL found — starting polling (dev mode)")
+        executor.start_polling(dp, skip_updates=True, loop=loop)
