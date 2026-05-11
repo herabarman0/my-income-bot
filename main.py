@@ -269,7 +269,7 @@ def get_settings() -> dict:
         "earn1":      s.get("earn1",      20),
         "earn2":      s.get("earn2",      25),
         "earn3":      s.get("earn3",      30),
-        "dailyBonus": s.get("dailyBonus", 5),
+        "dailyBonus": s.get("dailyBonus", 10),
     }
     _settings_cache["data"] = result
     _settings_cache["ts"]   = now
@@ -806,14 +806,14 @@ async def cb_approve_ver(call: types.CallbackQuery):
         ref_user = get_user(ref_uid) or {}
         lvl      = get_level(ref_user.get("points", 0), s)
         earn     = get_earn(lvl, s)
-        fb_txn_add(ref_uid, balance_delta=earn, points_delta=earn)  # ← race-safe
+        fb_txn_add(ref_uid, balance_delta=earn, points_delta=100)  # ← race-safe
         try:
             await bot.send_message(
                 int(ref_uid),
                 f"🎊 <b>রেফার বোনাস পেয়েছেন!</b>\n\n"
                 f"আপনার রেফার করা বন্ধু একটিভ হয়েছেন।\n"
                 f"💰 আপনার ব্যালেন্সে <b>৳{earn}</b> যোগ হয়েছে!\n"
-                f"🎯 পয়েন্ট: +{earn}"
+                f"🎯 পয়েন্ট: +100"
             )
         except:
             pass
