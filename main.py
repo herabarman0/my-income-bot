@@ -179,61 +179,45 @@ def fb_txn_add(uid: str, balance_delta: float = 0, points_delta: int = 0) -> boo
 # ═══════════════════════════════════════════════════════
 
 # ── ইউজার ক্যাশ ──
-MAX_CACHE_SIZE = 2000          # সর্বোচ্চ ২০০০ ইউজার RAM-এ থাকবে
-_user_cache: dict = {}         # { uid: user_dict }
+MAX_CACHE_SIZE = 2000
+USER_CACHE_TTL = 30                                # ৩০ সেকেন্ড — Admin edit সর্বোচ্চ ৩০ সেকেন্ডে দেখাবে
+_user_cache: dict = {}                             # { uid: {"data":{}, "ts":float} }
 
 def cache_get_user(uid: str):
-    """RAM থেকে ইউজার ডেটা দাও। না থাকলে None।"""
-    return _user_cache.get(uid)
+    entry = _user_cache.get(uid)
+    if entry is None:
+        return None
+    if (time.time() - entry["ts"]) > USER_CACHE_TTL:
+        del _user_cache[uid]                       # TTL শেষ — মুছে দাও
+        return None
+    return entry["data"]
 
 def cache_set_user(uid: str, data: dict):
-    """
-    RAM-এ ইউজার ডেটা রাখো।
-    ক্যাশ ভরে গেলে সবচেয়ে পুরনো ১০% মুছে দাও।
-    """
     if not data:
         return
     if len(_user_cache) >= MAX_CACHE_SIZE:
-        remove_count = MAX_CACHE_SIZE // 10        # ২০০ টা মুছবে
+        remove_count = MAX_CACHE_SIZE // 10
         for key in list(_user_cache.keys())[:remove_count]:
             del _user_cache[key]
-        log.debug(f"Cache evicted {remove_count} entries (size limit)")
-    _user_cache[uid] = dict(data)                  # shallow copy
+        log.debug(f"Cache evicted {remove_count} entries")
+    _user_cache[uid] = {"data": dict(data), "ts": time.time()}
 
 def cache_invalidate_user(uid: str):
-    """ইউজারের ক্যাশ মুছে ফেলো (ডেটা পরিবর্তন হলে)।"""
     _user_cache.pop(uid, None)
     log.debug(f"Cache invalidated: {uid}")
 
-# ── cached user fetch ──
 def get_user(uid: str) -> dict | None:
     """
-    প্রথমে RAM চেক করে। না থাকলে Firebase থেকে আনে।
-
-    Admin Panel থেকে balance/points বদলালে
-    সেখানে adminEditedAt timestamp লেখা হয়।
-    Cache-এর data-তে সেই timestamp নতুন থাকলে
-    cache bypass করে fresh data আনে।
+    RAM চেক → TTL ৩০ সেকেন্ড।
+    TTL শেষ হলে Firebase থেকে fresh data আনে।
+    Bot নিজে update করলে cache_invalidate_user() সাথে সাথে মুছে দেয়।
+    Admin Panel থেকে edit করলে সর্বোচ্চ ৩০ সেকেন্ডে দেখাবে।
     """
     cached = cache_get_user(uid)
     if cached is not None:
-        # Admin Panel থেকে edit হয়েছে কিনা চেক করো
-        # (শুধু adminEditedAt field টা আনো — ছোট read)
-        try:
-            remote_ts = fb_get(f"users/{uid}/adminEditedAt") or 0
-            cached_ts = cached.get("adminEditedAt", 0)
-            if remote_ts > cached_ts:
-                # Admin edit আছে — cache মুছে fresh আনো
-                cache_invalidate_user(uid)
-                log.debug(f"Admin edit detected for {uid}, cache bypassed")
-            else:
-                log.debug(f"Cache HIT: {uid}")
-                return cached
-        except Exception:
-            return cached   # চেক ব্যর্থ হলে cache-ই দাও
-
-    log.debug(f"Cache MISS: {uid}  → Firebase read")
-    data = fb_get(f"users/{uid}")                  # ← সরাসরি Firebase
+        return cached
+    log.debug(f"Cache MISS: {uid} → Firebase read")
+    data = fb_get(f"users/{uid}")
     if data:
         cache_set_user(uid, data)
     return data
@@ -241,13 +225,13 @@ def get_user(uid: str) -> dict | None:
 # ── cache-aware write helpers ──
 def update_user(uid: str, fields: dict):
     """Firebase আপডেট করে, তারপর ক্যাশ invalidate করে।"""
-    fb_update(f"users/{uid}", fields)              # ← সরাসরি Firebase
+    fb_update(f"users/{uid}", fields)
     cache_invalidate_user(uid)
 
 def put_user(uid: str, data: dict):
     """Firebase-এ নতুন ইউজার রাখে, তারপর ক্যাশ সেট করে।"""
     fb_put(f"users/{uid}", data)
-    cache_set_user(uid, data)                      # নতুন ডেটাই ক্যাশে রাখো
+    cache_set_user(uid, data)
 
 # ═══════════════════════════════════════════════════════
 #   SETTINGS CACHE  (TTL-based — ৬০ সেকেন্ড পর refresh)
@@ -904,10 +888,21 @@ async def menu_handler(message: types.Message, state: FSMContext):
 
     # ── হোম ──
     if txt == "🏠 হোম":
+        # সর্বদা fresh data আনো — balance/points সাথে সাথে দেখাবে
+        fresh = fb_get(f"users/{uid}")
+        if fresh:
+            cache_set_user(uid, fresh)
+            user = fresh
         await _show_home(message, uid, user, s)
 
     # ── প্রোফাইল ──
     elif txt == "📊 আমার প্রোফাইল":
+        # সর্বদা fresh data — Admin edit সাথে সাথে দেখাবে
+        fresh = fb_get(f"users/{uid}")
+        if fresh:
+            cache_set_user(uid, fresh)
+            user = fresh
+
         pts  = user.get("points", 0)
         bal  = user.get("balance", 0)
         lvl  = get_level(pts, s)
