@@ -1301,7 +1301,7 @@ async def watch_admin_paid_notifications():
     withdrawal-এ adminPaidNotify field লেখা হয়।
     এই watcher সেটা দেখে ইউজারকে Telegram message পাঠায়।
 
-    প্রতি ৮ সেকেন্ডে একবার চেক করে — দিনে ~১০,৮০০ read।
+    প্রতি ২০ সেকেন্ডে একবার চেক করে — দিনে ~ ৪৩২০ read।
     শুধু pending→success হওয়া records দেখে।
     """
     notified_wids: set = set()              # একই wid দুইবার notify না করতে
@@ -1321,7 +1321,7 @@ async def watch_admin_paid_notifications():
                     log.info(f"Admin panel paid notify sent: wid={wid} uid={notify_uid}")
         except Exception as e:
             log.debug(f"watch_admin_paid_notifications error: {e}")
-        await asyncio.sleep(8)
+        await asyncio.sleep(20)  # ৮ সেকেন্ড থেকে ২০ সেকেন্ড করে দেওয়া হয়েছে রিড বাচানোর জন্য
 async def _auto_delete_report(rid: str):
     """
     Telegram-এ পাঠানোর ৫ সেকেন্ড পর
