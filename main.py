@@ -1626,10 +1626,7 @@ async def fallback(message: types.Message, state: FSMContext):
 #   MAIN
 # ═══════════════════════════════════════════════════════
 if __name__ == '__main__':
-    keep_alive()
-    log.info("IncomeApp Bot starting...")
-
-    WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL', '')     # Render দেয় automatically
+    WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL', '')
     WEBHOOK_PATH = f"/webhook/{API_TOKEN}"
     WEBHOOK_URL  = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
@@ -1638,6 +1635,7 @@ if __name__ == '__main__':
 
     if WEBHOOK_HOST:
         # ── WEBHOOK (Production — Render) ──
+        # keep_alive() বন্ধ — Webhook server নিজেই port ব্যবহার করে
         log.info(f"Starting webhook: {WEBHOOK_URL}")
         from aiogram.utils.executor import start_webhook
 
@@ -1656,9 +1654,10 @@ if __name__ == '__main__':
             on_shutdown  = on_shutdown,
             skip_updates = True,
             host         = "0.0.0.0",
-            port         = int(os.getenv("PORT", 8080)),
+            port         = int(os.getenv("PORT", 10000)),
         )
     else:
         # ── POLLING (Local development) ──
-        log.info("No RENDER_EXTERNAL_URL found — starting polling (dev mode)")
+        keep_alive()   # শুধু local dev-এ Flask keep-alive চালু
+        log.info("No RENDER_EXTERNAL_URL — polling mode (dev)")
         executor.start_polling(dp, skip_updates=True, loop=loop)
