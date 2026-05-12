@@ -33,7 +33,13 @@ flask_app = Flask('')
 
 @flask_app.route('/')
 def home():
-    return "IncomeApp Bot ✅ Running"
+    cache_count = len(_user_cache)
+    return f"IncomeApp Bot ✅ Running | Cache: {cache_count} users"
+
+@flask_app.route('/health')
+def health():
+    """cron-job.org দিয়ে প্রতি ১৪ মিনিটে এই URL-এ ping করুন"""
+    return "OK", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -186,8 +192,8 @@ def fb_txn_add(uid: str, balance_delta: float = 0, points_delta: int = 0) -> boo
 # ═══════════════════════════════════════════════════════
 
 # ── ইউজার ক্যাশ ──
-MAX_CACHE_SIZE = 2000
-USER_CACHE_TTL = 30                                # ৩০ সেকেন্ড — Admin edit সর্বোচ্চ ৩০ সেকেন্ডে দেখাবে
+MAX_CACHE_SIZE = 5000                              # ফ্রি tier-এ ৫০০০ ইউজার RAM-এ রাখা যাবে
+USER_CACHE_TTL = 120                               # ১২০ সেকেন্ড — Firebase read কম হবে
 _user_cache: dict = {}                             # { uid: {"data":{}, "ts":float} }
 
 def cache_get_user(uid: str):
@@ -215,10 +221,10 @@ def cache_invalidate_user(uid: str):
 
 def get_user(uid: str) -> dict | None:
     """
-    RAM চেক → TTL ৩০ সেকেন্ড।
+    RAM চেক → TTL ১২০ সেকেন্ড।
     TTL শেষ হলে Firebase থেকে fresh data আনে।
     Bot নিজে update করলে cache_invalidate_user() সাথে সাথে মুছে দেয়।
-    Admin Panel থেকে edit করলে সর্বোচ্চ ৩০ সেকেন্ডে দেখাবে।
+    Admin Panel থেকে edit করলে সর্বোচ্চ ১২০ সেকেন্ডে দেখাবে।
     """
     cached = cache_get_user(uid)
     if cached is not None:
@@ -1762,8 +1768,8 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
 
     sent = 0
     failed = 0
-    # ১০০০ জন করে batch — RAM নিরাপদ থাকবে
-    BATCH = 1000
+    # ৫০ জন করে batch — Render free tier-এ memory safe
+    BATCH = 50
     for i in range(0, total_users, BATCH):
         batch = uid_list[i:i + BATCH]
         for uid_str in batch:
@@ -1775,10 +1781,15 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
                 sent += 1
             except Exception:
                 failed += 1
-            await asyncio.sleep(0.05)   # Telegram rate limit: 20 msg/sec
-        # প্রতি batch-এর পর ৫ সেকেন্ড বিরতি
+            await asyncio.sleep(0.034)   # ~30 msg/sec — Telegram safe limit
+        # প্রতি ৫০০ জনের পর progress জানান
+        if (i + BATCH) % 500 == 0 and i + BATCH < total_users:
+            await message.answer(
+                f"⏳ অগ্রগতি: {bn(i + BATCH)}/{bn(total_users)} জন সম্পন্ন..."
+            )
+        # প্রতি batch-এর পর ২ সেকেন্ড বিরতি
         if i + BATCH < total_users:
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
     await message.answer(
         f"✅ ব্রডকাস্ট সম্পন্ন!\n"
@@ -1842,7 +1853,7 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 @dp.message_handler(state="*")
 async def fallback(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = fb_get(f"users/{uid}")   # fresh data — cache নয়
+    user = get_user(uid)   # cache চেক করে, miss হলে Firebase থেকে আনে
     if user:
         cache_set_user(uid, user)
     if not user or user.get("status") != "active":
@@ -1856,10 +1867,26 @@ async def fallback(message: types.Message, state: FSMContext):
 # ═══════════════════════════════════════════════════════
 #   MAIN
 # ═══════════════════════════════════════════════════════
+
+async def cleanup_old_cache():
+    """প্রতি ঘণ্টায় মেয়াদ শেষ cache entries মুছে RAM মুক্ত রাখে"""
+    while True:
+        await asyncio.sleep(3600)  # ১ ঘণ্টা
+        now = time.time()
+        expired = [uid for uid, entry in list(_user_cache.items())
+                   if (now - entry["ts"]) > USER_CACHE_TTL]
+        for uid in expired:
+            _user_cache.pop(uid, None)
+        if expired:
+            log.info(f"🧹 Cache cleanup: {len(expired)} expired entries removed. "
+                     f"Remaining: {len(_user_cache)}")
+
 if __name__ == '__main__':
     keep_alive()   # Flask port 8080 — Render health check
     log.info("IncomeApp Bot starting (polling mode)...")
+    log.info("💡 Tip: cron-job.org দিয়ে /health URL প্রতি ১৪ মিনিটে ping করুন।")
 
     loop = asyncio.get_event_loop()
     loop.create_task(watch_admin_paid_notifications())
+    loop.create_task(cleanup_old_cache())   # ← hourly cache cleanup
     executor.start_polling(dp, skip_updates=True, loop=loop)
