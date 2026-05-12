@@ -389,6 +389,9 @@ def admin_kb():
         KeyboardButton("📊 ড্যাশবোর্ড"),
         KeyboardButton("⏳ পেন্ডিং ভেরিফিকেশন"),
         KeyboardButton("💸 পেন্ডিং উইথড্রয়াল"),
+        KeyboardButton("📋 উইথড্র হিস্ট্রি"),
+        KeyboardButton("👥 একটিভ ইউজার লিস্ট"),
+        KeyboardButton("🏆 টপ রেফারার"),
         KeyboardButton("📢 ব্রডকাস্ট করুন"),
         KeyboardButton("⚙️ সেটিংস দেখুন"),
         KeyboardButton("🏠 মেইন মেনু"),
@@ -850,6 +853,11 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
 # ═══════════════════════════════════════════════════════
 @dp.callback_query_handler(lambda c: c.data.startswith("approve_ver_"))
 async def cb_approve_ver(call: types.CallbackQuery):
+    # শুধু Admin approve করতে পারবে
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("শুধু অ্যাডমিন এই কাজ করতে পারবেন!", show_alert=True)
+        return
+
     parts  = call.data.replace("approve_ver_", "").split("|")
     uid    = parts[0]
     vid    = parts[1] if len(parts) > 1 else None
@@ -859,14 +867,14 @@ async def cb_approve_ver(call: types.CallbackQuery):
     if vid:
         fb_update(f"verifications/{vid}", {"status": "approved", "approvedAt": int(time.time() * 1000)})
 
-    # ── stats counter +1 ──
+    # stats counter +1
     try:
         cur = fb_get("stats/active_users") or 0
         fb_put("stats/active_users", cur + 1)
     except Exception:
         pass
 
-    # ── আজকের revenue আপডেট (approve করার সময়ের ফি দিয়ে) ──
+    # আজকের revenue আপডেট
     today_key  = datetime.now().strftime("%Y-%m-%d")
     fee_now    = s.get("fee", 50)
     prev_rev   = fb_get(f"dailyRevenue/{today_key}") or 0
@@ -879,8 +887,8 @@ async def cb_approve_ver(call: types.CallbackQuery):
         ref_user = get_user(ref_uid) or {}
         lvl      = get_level(ref_user.get("points", 0), s)
         earn     = get_earn(lvl, s)
-        REF_POINTS = 100   # ← প্রতি রেফারে ১০০ পয়েন্ট (এখানে বদলান)
-        fb_txn_add(ref_uid, balance_delta=earn, points_delta=REF_POINTS)  # ← race-safe
+        REF_POINTS = 100
+        fb_txn_add(ref_uid, balance_delta=earn, points_delta=REF_POINTS)
         try:
             await bot.send_message(
                 int(ref_uid),
@@ -889,7 +897,7 @@ async def cb_approve_ver(call: types.CallbackQuery):
                 f"💰 আপনার ব্যালেন্সে <b>৳{earn}</b> যোগ হয়েছে!\n"
                 f"🎯 পয়েন্ট: +{REF_POINTS}"
             )
-        except:
+        except Exception:
             pass
 
     # Notify new user
@@ -900,17 +908,29 @@ async def cb_approve_ver(call: types.CallbackQuery):
             f"এখন রেফার করে আয় শুরু করুন! 🎉",
             reply_markup=main_kb()
         )
-    except:
+    except Exception:
         pass
 
-    await call.message.edit_text(
-        call.message.text + f"\n\n✅ <b>অ্যাপ্রুভড</b> — {datetime.now().strftime('%H:%M')}"
-    )
-    await call.answer("অ্যাপ্রুভ সম্পন্ন!")
+    # মেসেজ edit করো — button সরিয়ে দাও
+    try:
+        await call.message.edit_text(
+            call.message.html_text + f"\n\n<b>✅ অ্যাপ্রুভড — {datetime.now().strftime('%H:%M')}</b>",
+            reply_markup=None
+        )
+    except Exception:
+        try:
+            await call.message.answer(f"✅ UID <code>{uid}</code> অ্যাপ্রুভ হয়েছে।")
+        except Exception:
+            pass
+    await call.answer("✅ অ্যাপ্রুভ সম্পন্ন!")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("reject_ver_"))
 async def cb_reject_ver(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("শুধু অ্যাডমিন এই কাজ করতে পারবেন!", show_alert=True)
+        return
+
     parts = call.data.replace("reject_ver_", "").split("|")
     uid   = parts[0]
     vid   = parts[1] if len(parts) > 1 else None
@@ -926,13 +946,20 @@ async def cb_reject_ver(call: types.CallbackQuery):
             "ট্রান্জেকশন আইডি সঠিক ছিল না।\n"
             "পুনরায় সঠিক পেমেন্ট করে /pay দিন।"
         )
-    except:
+    except Exception:
         pass
 
-    await call.message.edit_text(
-        call.message.text + f"\n\n❌ <b>রিজেক্টেড</b> — {datetime.now().strftime('%H:%M')}"
-    )
-    await call.answer("রিজেক্ট সম্পন্ন!")
+    try:
+        await call.message.edit_text(
+            call.message.html_text + f"\n\n<b>❌ রিজেক্টেড — {datetime.now().strftime('%H:%M')}</b>",
+            reply_markup=None
+        )
+    except Exception:
+        try:
+            await call.message.answer(f"❌ UID <code>{uid}</code> রিজেক্ট হয়েছে।")
+        except Exception:
+            pass
+    await call.answer("❌ রিজেক্ট সম্পন্ন!")
 
 # ═══════════════════════════════════════════════════════
 #   MAIN MENU HANDLERS
@@ -1582,6 +1609,103 @@ async def admin_handler(message: types.Message, state: FSMContext):
         user = get_user(str(message.from_user.id)) or {}
         s    = get_settings()
         await _show_home(message, str(message.from_user.id), user, s)
+
+    # ── উইথড্র হিস্ট্রি ──
+    elif "📋 উইথড্র হিস্ট্রি" in txt:
+        withs = fb_get("withdrawals") or {}
+        done  = [(wid, w) for wid, w in withs.items()
+                 if w.get("status") in ("paid", "rejected")]
+        done.sort(key=lambda x: x[1].get("createdAt", 0), reverse=True)
+
+        if not done:
+            await message.answer("📋 কোনো সম্পন্ন উইথড্রয়াল নেই।")
+            return
+
+        lines = [f"📋 <b>উইথড্র হিস্ট্রি (সর্বশেষ {min(len(done),15)} টি)</b>\n"]
+        for wid, w in done[:15]:
+            icon   = "✅" if w.get("status") == "paid" else "❌"
+            ts     = w.get("createdAt", 0)
+            dt_str = datetime.fromtimestamp(ts / 1000).strftime("%d/%m %H:%M") if ts else "?"
+            lines.append(
+                f"{icon} {w.get('name','?')} | ৳{w.get('amount','?')} | "
+                f"{w.get('method','?').upper()} | {dt_str}"
+            )
+        await message.answer("\n".join(lines))
+
+    # ── একটিভ ইউজার লিস্ট ──
+    elif "👥 একটিভ ইউজার লিস্ট" in txt:
+        await message.answer("⏳ একটিভ ইউজার লোড হচ্ছে...")
+        try:
+            all_users = fdb.reference("users").order_by_child("status").equal_to("active").get() or {}
+        except Exception as e:
+            await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
+            return
+
+        if not all_users:
+            await message.answer("কোনো একটিভ ইউজার নেই।")
+            return
+
+        user_list = sorted(
+            all_users.items(),
+            key=lambda x: x[1].get("verifiedAt", 0),
+            reverse=True
+        )
+        total = len(user_list)
+        lines = [f"✅ <b>একটিভ ইউজার ({bn(total)} জন) — সর্বশেষ ২০ জন:</b>\n"]
+        for i, (uid_key, u) in enumerate(user_list[:20], 1):
+            ts     = u.get("verifiedAt", 0)
+            dt_str = datetime.fromtimestamp(ts / 1000).strftime("%d/%m/%y") if ts else "?"
+            lines.append(
+                f"{bn(i)}. {u.get('name','?')} | "
+                f"📞 {u.get('phone','?')} | "
+                f"💰 ৳{u.get('balance', 0)} | {dt_str}"
+            )
+        await message.answer("\n".join(lines))
+
+    # ── টপ রেফারার ──
+    elif "🏆 টপ রেফারার" in txt:
+        await message.answer("⏳ টপ রেফারার লোড হচ্ছে...")
+        try:
+            all_users = fdb.reference("users").order_by_child("status").equal_to("active").get() or {}
+        except Exception as e:
+            await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
+            return
+
+        # প্রতিটি ইউজারের referredBy গণনা করো
+        ref_count: dict = {}
+        ref_info:  dict = {}
+        for uid_key, u in all_users.items():
+            ref_uid = u.get("referredBy")
+            if ref_uid:
+                ref_count[ref_uid] = ref_count.get(ref_uid, 0) + 1
+
+        # নাম ও ফোন সংগ্রহ
+        for uid_key, u in all_users.items():
+            if uid_key in ref_count:
+                ref_info[uid_key] = {
+                    "name":    u.get("name", "?"),
+                    "phone":   u.get("phone", "?"),
+                    "balance": u.get("balance", 0),
+                    "points":  u.get("points", 0),
+                }
+
+        if not ref_count:
+            await message.answer("🏆 এখনো কোনো রেফার হয়নি।")
+            return
+
+        top = sorted(ref_count.items(), key=lambda x: x[1], reverse=True)[:10]
+        lines = ["🏆 <b>টপ রেফারার (শীর্ষ ১০)</b>\n"]
+        medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+        for i, (uid_key, count) in enumerate(top):
+            info = ref_info.get(uid_key, {})
+            lines.append(
+                f"{medals[i]} {info.get('name','?')} | "
+                f"📞 {info.get('phone','?')}\n"
+                f"   👥 রেফার: {bn(count)} জন | "
+                f"💰 ৳{info.get('balance',0)} | "
+                f"🎯 {bn(info.get('points',0))} পয়েন্ট\n"
+            )
+        await message.answer("\n".join(lines))
 
     else:
         # fallback — treat admin as user if not a command
