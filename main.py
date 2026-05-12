@@ -36,9 +36,8 @@ def home():
     return "IncomeApp Bot ✅ Running"
 
 def run_flask():
-    # Flask সবসময় 8080-এ — Webhook 10000-এ (PORT env)
-    # দুটো আলাদা port, কোনো conflict নেই
-    flask_app.run(host='0.0.0.0', port=8080, use_reloader=False)
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 def keep_alive():
     t = Thread(target=run_flask, daemon=True)
@@ -1641,7 +1640,9 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 @dp.message_handler(state="*")
 async def fallback(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = get_user(uid)
+    user = fb_get(f"users/{uid}")   # fresh data — cache নয়
+    if user:
+        cache_set_user(uid, user)
     if not user or user.get("status") != "active":
         await cmd_start(message, state)
         return
@@ -1654,40 +1655,9 @@ async def fallback(message: types.Message, state: FSMContext):
 #   MAIN
 # ═══════════════════════════════════════════════════════
 if __name__ == '__main__':
-    WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL', '')
-    WEBHOOK_PATH = f"/webhook/{API_TOKEN}"
-    WEBHOOK_URL  = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+    keep_alive()   # Flask port 8080 — Render health check
+    log.info("IncomeApp Bot starting (polling mode)...")
 
     loop = asyncio.get_event_loop()
     loop.create_task(watch_admin_paid_notifications())
-
-    if WEBHOOK_HOST:
-        # ── WEBHOOK (Production — Render) ──
-        # Flask আলাদা thread-এ চলবে — শুধু health check "/" এর জন্য
-        # এটা port conflict করবে না কারণ webhook আলাদা port নেয়
-        keep_alive()   # Flask → "/" → 200 OK (Render health check)
-        log.info(f"Webhook URL: {WEBHOOK_URL}")
-        from aiogram.utils.executor import start_webhook
-
-        async def on_startup(dp):
-            await bot.set_webhook(WEBHOOK_URL)
-            log.info("Webhook registered ✅")
-
-        async def on_shutdown(dp):
-            await bot.delete_webhook()
-
-        start_webhook(
-            dispatcher   = dp,
-            webhook_path = WEBHOOK_PATH,
-            on_startup   = on_startup,
-            on_shutdown  = on_shutdown,
-            skip_updates = True,
-            host         = "0.0.0.0",
-            port         = int(os.getenv("PORT", 10000)),
-        )
-
-    else:
-        # ── POLLING (Local dev) ──
-        keep_alive()
-        log.info("Polling mode (dev)")
-        executor.start_polling(dp, skip_updates=True, loop=loop)
+    executor.start_polling(dp, skip_updates=True, loop=loop)
