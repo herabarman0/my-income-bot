@@ -858,6 +858,9 @@ async def cb_approve_ver(call: types.CallbackQuery):
         await call.answer("শুধু অ্যাডমিন এই কাজ করতে পারবেন!", show_alert=True)
         return
 
+    # ── আগেই answer করো — Telegram timeout এড়াতে ──
+    await call.answer("⏳ প্রসেস হচ্ছে...")
+
     parts  = call.data.replace("approve_ver_", "").split("|")
     uid    = parts[0]
     vid    = parts[1] if len(parts) > 1 else None
@@ -911,18 +914,19 @@ async def cb_approve_ver(call: types.CallbackQuery):
     except Exception:
         pass
 
-    # মেসেজ edit করো — button সরিয়ে দাও
+    # ── বাটন সরিয়ে approved text দেখাও ──
+    # aiogram v2-তে html_text নেই — তাই নতুন text build করো
+    old_text = call.message.text or ""
+    new_text = old_text + f"\n\n✅ অ্যাপ্রুভড — {datetime.now().strftime('%d/%m %H:%M')}"
     try:
-        await call.message.edit_text(
-            call.message.html_text + f"\n\n<b>✅ অ্যাপ্রুভড — {datetime.now().strftime('%H:%M')}</b>",
-            reply_markup=None
-        )
+        await call.message.edit_text(new_text, reply_markup=None)
     except Exception:
-        try:
-            await call.message.answer(f"✅ UID <code>{uid}</code> অ্যাপ্রুভ হয়েছে।")
-        except Exception:
-            pass
-    await call.answer("✅ অ্যাপ্রুভ সম্পন্ন!")
+        # edit না হলে নতুন message পাঠাও
+        await call.message.answer(
+            f"✅ <b>অ্যাপ্রুভড!</b>\n"
+            f"UID: <code>{uid}</code>\n"
+            f"সময়: {datetime.now().strftime('%d/%m %H:%M')}"
+        )
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("reject_ver_"))
@@ -930,6 +934,8 @@ async def cb_reject_ver(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         await call.answer("শুধু অ্যাডমিন এই কাজ করতে পারবেন!", show_alert=True)
         return
+
+    await call.answer("⏳ প্রসেস হচ্ছে...")
 
     parts = call.data.replace("reject_ver_", "").split("|")
     uid   = parts[0]
@@ -949,17 +955,16 @@ async def cb_reject_ver(call: types.CallbackQuery):
     except Exception:
         pass
 
+    old_text = call.message.text or ""
+    new_text = old_text + f"\n\n❌ রিজেক্টেড — {datetime.now().strftime('%d/%m %H:%M')}"
     try:
-        await call.message.edit_text(
-            call.message.html_text + f"\n\n<b>❌ রিজেক্টেড — {datetime.now().strftime('%H:%M')}</b>",
-            reply_markup=None
-        )
+        await call.message.edit_text(new_text, reply_markup=None)
     except Exception:
-        try:
-            await call.message.answer(f"❌ UID <code>{uid}</code> রিজেক্ট হয়েছে।")
-        except Exception:
-            pass
-    await call.answer("❌ রিজেক্ট সম্পন্ন!")
+        await call.message.answer(
+            f"❌ <b>রিজেক্টেড!</b>\n"
+            f"UID: <code>{uid}</code>\n"
+            f"সময়: {datetime.now().strftime('%d/%m %H:%M')}"
+        )
 
 # ═══════════════════════════════════════════════════════
 #   MAIN MENU HANDLERS
@@ -1312,30 +1317,36 @@ async def cb_mark_paid(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         await call.answer("শুধু অ্যাডমিন করতে পারবেন!", show_alert=True)
         return
+
+    await call.answer("⏳ প্রসেস হচ্ছে...")
+
     wid = call.data.replace("paid_", "")
     w   = fb_get(f"withdrawals/{wid}")
     if not w:
-        await call.answer("রিকোয়েস্ট পাওয়া যায়নি!", show_alert=True)
+        await call.message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি!")
         return
 
-    # ── Double payment আটকাও ──
+    # Double payment আটকাও
     if w.get("status") == "success":
-        await call.answer("এটা আগেই পেমেন্ট হয়ে গেছে!", show_alert=True)
+        await call.message.answer("⚠️ এটা আগেই পেমেন্ট হয়ে গেছে!")
         return
 
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
 
-    # balance আর কাটা হবে না — withdraw submit করার সময়ই কাটা হয়েছে
     fb_update(f"withdrawals/{wid}", {"status": "success", "paidAt": int(time.time() * 1000)})
 
-    # ── ইউজারকে notification ──
     await _notify_user_paid(uid, w)
 
-    await call.message.edit_text(
-        call.message.text + f"\n\n✅ <b>PAID</b> — {datetime.now().strftime('%H:%M')}"
-    )
-    await call.answer("পেমেন্ট মার্ক করা হয়েছে!")
+    old_text = call.message.text or ""
+    new_text = old_text + f"\n\n✅ PAID — {datetime.now().strftime('%d/%m %H:%M')}"
+    try:
+        await call.message.edit_text(new_text, reply_markup=None)
+    except Exception:
+        await call.message.answer(
+            f"✅ <b>পেমেন্ট মার্ক হয়েছে!</b>\n"
+            f"WID: <code>{wid}</code> | ৳{amount}"
+        )
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("wreject_"))
@@ -1343,24 +1354,31 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         await call.answer("শুধু অ্যাডমিন করতে পারবেন!", show_alert=True)
         return
+
+    await call.answer("⏳ প্রসেস হচ্ছে...")
+
     wid = call.data.replace("wreject_", "")
     w   = fb_get(f"withdrawals/{wid}")
     if not w:
-        await call.answer("রিকোয়েস্ট পাওয়া যায়নি!", show_alert=True)
+        await call.message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি!")
         return
 
     fb_update(f"withdrawals/{wid}", {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
-    # Refund — race-safe যোগ
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
-    fb_txn_add(uid, balance_delta=+amount)             # ← race-safe রিফান্ড
+    fb_txn_add(uid, balance_delta=+amount)
 
     await _notify_user_rejected(uid, w)
 
-    await call.message.edit_text(
-        call.message.text + f"\n\n❌ <b>REJECTED</b> — {datetime.now().strftime('%H:%M')}"
-    )
-    await call.answer("রিজেক্ট করা হয়েছে!")
+    old_text = call.message.text or ""
+    new_text = old_text + f"\n\n❌ REJECTED — {datetime.now().strftime('%d/%m %H:%M')}"
+    try:
+        await call.message.edit_text(new_text, reply_markup=None)
+    except Exception:
+        await call.message.answer(
+            f"❌ <b>রিজেক্ট হয়েছে!</b>\n"
+            f"WID: <code>{wid}</code> | ৳{amount} রিফান্ড হয়েছে।"
+        )
 
 # ═══════════════════════════════════════════════════════
 #   REPORT FLOW
