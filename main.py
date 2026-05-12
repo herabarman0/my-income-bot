@@ -1383,6 +1383,11 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
         await call.message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি!")
         return
 
+     if w.get("status") != "pending":
+        await call.message.edit_text(f"⚠️ এই রিকোয়েস্টটি ইতিমধ্যে {w.get('status')} করা হয়েছে।")
+        await call.answer("ইতিমধ্যে প্রসেস করা হয়েছে!", show_alert=True)
+        return
+
     fb_update(f"withdrawals/{wid}", {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
