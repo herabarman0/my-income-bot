@@ -33,11 +33,12 @@ flask_app = Flask('')
 
 @flask_app.route('/')
 def home():
-    return "IncomeApp Bot is Running! ✅"
+    return "IncomeApp Bot ✅ Running"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port)
+    # Flask সবসময় 8080-এ — Webhook 10000-এ (PORT env)
+    # দুটো আলাদা port, কোনো conflict নেই
+    flask_app.run(host='0.0.0.0', port=8080, use_reloader=False)
 
 def keep_alive():
     t = Thread(target=run_flask, daemon=True)
@@ -576,25 +577,28 @@ async def reg_phone(message: types.Message, state: FSMContext):
         match_phone = fdb.reference("users").order_by_child("phone").equal_to(phone).get()
     except Exception:
         match_phone = None
-    if match_phone:
-        existing = list(match_phone.values())[0]
-        st = existing.get("status", "pending")
-        if st == "active":
-            await message.answer(
-                "❌ এই ফোন নম্বরে আগেই একটি একটিভ অ্যাকাউন্ট আছে।\n"
-                "লগইন করতে /start দিন।"
-            )
-        elif st in ("pending", "review", "new"):
-            await message.answer(
-                "⚠️ এই ফোন নম্বরে একটি অ্যাকাউন্ট পেমেন্ট ভেরিফিকেশনের অপেক্ষায় আছে।\n"
-                "স্ট্যাটাস দেখতে /status দিন।"
-            )
-        else:
-            await message.answer(
-                "❌ এই ফোন নম্বর দিয়ে অ্যাকাউন্ট তৈরি করা যাবে না।\n"
-                "সাপোর্টে যোগাযোগ করুন: /support"
-            )
-        return
+
+    if match_phone and isinstance(match_phone, dict):
+        vals = list(match_phone.values())
+        if vals:
+            existing = vals[0]
+            st = existing.get("status", "pending")
+            if st == "active":
+                await message.answer(
+                    "❌ এই ফোন নম্বরে আগেই একটি একটিভ অ্যাকাউন্ট আছে।\n"
+                    "লগইন করতে /start দিন।"
+                )
+            elif st in ("pending", "review", "new"):
+                await message.answer(
+                    "⚠️ এই ফোন নম্বরে একটি অ্যাকাউন্ট পেমেন্ট ভেরিফিকেশনের অপেক্ষায় আছে।\n"
+                    "স্ট্যাটাস দেখতে /status দিন।"
+                )
+            else:
+                await message.answer(
+                    "❌ এই ফোন নম্বর দিয়ে অ্যাকাউন্ট তৈরি করা যাবে না।\n"
+                    "সাপোর্টে যোগাযোগ করুন: /support"
+                )
+            return
 
     await state.update_data(phone=phone)
     await Reg.ref_code.set()
@@ -1168,6 +1172,13 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
         await message.answer(f"❌ পর্যাপ্ত ব্যালেন্স নেই। আপনার ব্যালেন্স: ৳{bal}")
         return
 
+    # ── সাথে সাথে balance কেটে নাও (নিরাপদ) ──
+    # এতে একই balance দিয়ে বারবার request পাঠানো যাবে না
+    deducted = fb_txn_add(uid, balance_delta=-amount)
+    if not deducted:
+        await message.answer("❌ ব্যালেন্স আপডেটে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+        return
+
     wid = fb_push("withdrawals", {
         "uid":         uid,
         "name":        user.get("name", "?"),
@@ -1227,8 +1238,8 @@ async def cb_mark_paid(call: types.CallbackQuery):
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
 
+    # balance আর কাটা হবে না — withdraw submit করার সময়ই কাটা হয়েছে
     fb_update(f"withdrawals/{wid}", {"status": "success", "paidAt": int(time.time() * 1000)})
-    fb_txn_add(uid, balance_delta=-amount)             # ← race-safe বিয়োগ
 
     # ── ইউজারকে notification ──
     await _notify_user_paid(uid, w)
@@ -1301,7 +1312,7 @@ async def watch_admin_paid_notifications():
     withdrawal-এ adminPaidNotify field লেখা হয়।
     এই watcher সেটা দেখে ইউজারকে Telegram message পাঠায়।
 
-    প্রতি ২০ সেকেন্ডে একবার চেক করে — দিনে ~ ৪৩২০ read।
+    প্রতি ৮ সেকেন্ডে একবার চেক করে — দিনে ~১০,৮০০ read।
     শুধু pending→success হওয়া records দেখে।
     """
     notified_wids: set = set()              # একই wid দুইবার notify না করতে
@@ -1321,7 +1332,7 @@ async def watch_admin_paid_notifications():
                     log.info(f"Admin panel paid notify sent: wid={wid} uid={notify_uid}")
         except Exception as e:
             log.debug(f"watch_admin_paid_notifications error: {e}")
-        await asyncio.sleep(20)  # ৮ সেকেন্ড থেকে ২০ সেকেন্ড করে দেওয়া হয়েছে রিড বাচানোর জন্য
+        await asyncio.sleep(8)
 async def _auto_delete_report(rid: str):
     """
     Telegram-এ পাঠানোর ৫ সেকেন্ড পর
@@ -1635,17 +1646,18 @@ if __name__ == '__main__':
 
     if WEBHOOK_HOST:
         # ── WEBHOOK (Production — Render) ──
-        # keep_alive() বন্ধ — Webhook server নিজেই port ব্যবহার করে
-        log.info(f"Starting webhook: {WEBHOOK_URL}")
+        # Flask আলাদা thread-এ চলবে — শুধু health check "/" এর জন্য
+        # এটা port conflict করবে না কারণ webhook আলাদা port নেয়
+        keep_alive()   # Flask → "/" → 200 OK (Render health check)
+        log.info(f"Webhook URL: {WEBHOOK_URL}")
         from aiogram.utils.executor import start_webhook
 
         async def on_startup(dp):
             await bot.set_webhook(WEBHOOK_URL)
-            log.info("Webhook set ✅")
+            log.info("Webhook registered ✅")
 
         async def on_shutdown(dp):
             await bot.delete_webhook()
-            log.info("Webhook deleted")
 
         start_webhook(
             dispatcher   = dp,
@@ -1656,8 +1668,9 @@ if __name__ == '__main__':
             host         = "0.0.0.0",
             port         = int(os.getenv("PORT", 10000)),
         )
+
     else:
-        # ── POLLING (Local development) ──
-        keep_alive()   # শুধু local dev-এ Flask keep-alive চালু
-        log.info("No RENDER_EXTERNAL_URL — polling mode (dev)")
+        # ── POLLING (Local dev) ──
+        keep_alive()
+        log.info("Polling mode (dev)")
         executor.start_polling(dp, skip_updates=True, loop=loop)
