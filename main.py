@@ -349,6 +349,7 @@ class Reg(StatesGroup):
 
 class Pay(StatesGroup):
     choose_method = State()
+    sender_phone  = State()
     txn_id        = State()
 
 class Withdraw(StatesGroup):
@@ -701,12 +702,53 @@ async def pay_method(call: types.CallbackQuery, state: FSMContext):
     method = call.data.split("_")[1]
     await state.update_data(method=method)
 
-    await Pay.txn_id.set()
+    await Pay.sender_phone.set()
     await call.message.answer(
         f"✅ মেথড: <b>{'বিকাশ' if method=='bkash' else 'নগদ'}</b>\n\n"
-        f"🆔 আপনার ট্রান্জেকশন আইডি দিন:"
+        f"📱 যে নম্বর থেকে টাকা পাঠিয়েছেন সেই <b>ফোন নম্বর</b> দিন (১১ সংখ্যা):\n"
+        f"উদাহরণ: <code>01712345678</code>"
     )
     await call.answer()
+
+
+@dp.message_handler(state=Pay.sender_phone)
+async def pay_sender_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+
+    # ── ফরম্যাট চেক ──
+    if not phone.isdigit():
+        await message.answer(
+            "❌ ফোন নম্বরে শুধু সংখ্যা থাকবে, কোনো স্পেস বা '-' নয়।\n"
+            "উদাহরণ: <code>01712345678</code>"
+        )
+        return
+    if len(phone) != 11:
+        await message.answer(
+            f"❌ ফোন নম্বর ঠিক ১১ সংখ্যার হতে হবে।\n"
+            f"আপনি দিয়েছেন {len(phone)} সংখ্যা।\n"
+            f"উদাহরণ: <code>01712345678</code>"
+        )
+        return
+    if not phone.startswith("01"):
+        await message.answer(
+            "❌ বাংলাদেশের নম্বর <b>01</b> দিয়ে শুরু হওয়া উচিত।\n"
+            "উদাহরণ: <code>01712345678</code>"
+        )
+        return
+    valid_prefixes = ("011", "013", "014", "015", "016", "017", "018", "019")
+    if not any(phone.startswith(p) for p in valid_prefixes):
+        await message.answer(
+            "❌ সঠিক অপারেটর কোড দিন (011-019)।\n"
+            "উদাহরণ: <code>01712345678</code>"
+        )
+        return
+
+    await state.update_data(sender_phone=phone)
+    await Pay.txn_id.set()
+    await message.answer(
+        f"✅ নম্বর সেভ হয়েছে: <code>{phone}</code>\n\n"
+        f"🆔 এখন আপনার <b>ট্রান্জেকশন আইডি (TxnID)</b> দিন:"
+    )
 
 def _validate_txn(txn: str, method: str) -> tuple[bool, str]:
     """
@@ -737,6 +779,7 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
     data   = await state.get_data()
     txn    = message.text.strip()
     method = data.get("method", "bkash")
+    sender_phone = data.get("sender_phone", "?")
 
     valid, err_msg = _validate_txn(txn, method)
     if not valid:
@@ -764,6 +807,7 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         "uid":           uid,
         "name":          user.get("name", "?"),
         "phone":         user.get("phone", "?"),
+        "senderPhone":   sender_phone,
         "method":        method,
         "transactionId": txn,
         "status":        "pending",
@@ -777,7 +821,8 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         f"🔔 <b>নতুন ভেরিফিকেশন রিকোয়েস্ট</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 নাম:  {user.get('name','?')}\n"
-        f"📞 ফোন: {user.get('phone','?')}\n"
+        f"📞 রেজিস্ট্রেশন ফোন: {user.get('phone','?')}\n"
+        f"📱 পেমেন্ট পাঠানো নম্বর: <code>{sender_phone}</code>\n"
         f"💳 মেথড: {method.upper()}\n"
         f"🆔 TxnID: <code>{txn}</code>\n"
         f"🕐 সময়: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
@@ -1479,7 +1524,8 @@ async def admin_handler(message: types.Message, state: FSMContext):
             uid = v.get("uid", "?")
             kb  = approve_reject_kb(f"{uid}|{vid}", "ver")
             await message.answer(
-                f"👤 {v.get('name','?')} | 📞 {v.get('phone','?')}\n"
+                f"👤 {v.get('name','?')} | 📞 রেজি: {v.get('phone','?')}\n"
+                f"📱 পেমেন্ট নম্বর: <code>{v.get('senderPhone','?')}</code>\n"
                 f"💳 {v.get('method','?').upper()} | 🆔 <code>{v.get('transactionId','?')}</code>",
                 reply_markup=kb
             )
