@@ -83,17 +83,24 @@ log     = logging.getLogger(__name__)
 #   Admin SDK এই rules বাইপাস করে কাজ করে। ✅
 # ═══════════════════════════════════════════════════════
 _firebase_keys_raw = os.getenv('FIREBASE_KEYS', '')
+_firebase_ok = False
 
 if _firebase_keys_raw and FIREBASE_URL:
     try:
         _cred_dict = json.loads(_firebase_keys_raw)
         _cred      = credentials.Certificate(_cred_dict)
         firebase_admin.initialize_app(_cred, {'databaseURL': FIREBASE_URL})
+        _firebase_ok = True
         log.info("✅ Firebase Admin SDK initialized")
+    except json.JSONDecodeError as _e:
+        log.error(f"❌ FIREBASE_KEYS JSON parse error: {_e}")
+        log.error("FIREBASE_KEYS-এ পুরো JSON কপি করুন, কোনো line break ছাড়া।")
     except Exception as _e:
         log.error(f"❌ Firebase init error: {_e}")
-else:
-    log.error("❌ FIREBASE_KEYS বা FIREBASE_URL পাওয়া যায়নি!")
+elif not FIREBASE_URL:
+    log.error("❌ FIREBASE_URL পাওয়া যায়নি! Render-এ Environment Variable যোগ করুন।")
+elif not _firebase_keys_raw:
+    log.error("❌ FIREBASE_KEYS পাওয়া যায়নি! Render-এ Environment Variable যোগ করুন।")
 
 # ═══════════════════════════════════════════════════════
 #   FIREBASE HELPERS  (Admin SDK version)
@@ -893,16 +900,26 @@ async def cb_reject_ver(call: types.CallbackQuery):
 ], state="*")
 async def menu_handler(message: types.Message, state: FSMContext):
     await state.finish()
-    uid  = str(message.from_user.id)
+    uid = str(message.from_user.id)
 
     if not await app_check(uid, message):
         return
 
-    user = get_user(uid)
+    # সবসময় fresh data আনো — cache stale status এড়াতে
+    # ── EXISTING USER — সবসময় Firebase থেকে fresh ──
+    user = fb_get(f"users/{uid}")
+    if user:
+        cache_set_user(uid, user)
+    if user:
+        cache_set_user(uid, user)   # cache আপডেট করো
     if not user:
         await message.answer("প্রথমে /start দিন।")
         return
+    if user.get("status") == "banned":
+        await message.answer("🚫 আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে।")
+        return
     if user.get("status") != "active":
+        # active না হলে start flow-এ পাঠাও
         await cmd_start(message, state)
         return
 
