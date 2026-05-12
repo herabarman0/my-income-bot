@@ -986,8 +986,6 @@ async def menu_handler(message: types.Message, state: FSMContext):
     user = fb_get(f"users/{uid}")
     if user:
         cache_set_user(uid, user)
-    if user:
-        cache_set_user(uid, user)   # cache আপডেট করো
     if not user:
         await message.answer("প্রথমে /start দিন।")
         return
@@ -1154,7 +1152,7 @@ async def menu_handler(message: types.Message, state: FSMContext):
 
         lines = ["📋 <b>পেমেন্ট হিস্ট্রি</b>\n━━━━━━━━━━━━━━━━━━"]
         for w in my_list[:10]:
-            st_icon = "✅" if w.get("status") == "success" else "⏳" if w.get("status") == "pending" else "❌"
+            st_icon = "✅" if w.get("status") in ("paid", "success") else "⏳" if w.get("status") == "pending" else "❌"
             ts = datetime.fromtimestamp(w.get("requestedAt", 0) / 1000).strftime('%d/%m %H:%M')
             lines.append(
                 f"{st_icon} ৳{w.get('amount','?')} → {w.get('number','?')} "
@@ -1265,6 +1263,22 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
         await message.answer(f"❌ পর্যাপ্ত ব্যালেন্স নেই। আপনার ব্যালেন্স: ৳{bal}")
         return
 
+    # ── আগে থেকে pending উইথড্র আছে কিনা চেক করো ──
+    # একই সময়ে একাধিক রিকোয়েস্ট পাঠানো আটকাতে
+    try:
+        existing_withs = fdb.reference("withdrawals").order_by_child("uid").equal_to(uid).get() or {}
+        has_pending = any(w.get("status") == "pending" for w in existing_withs.values())
+        if has_pending:
+            await message.answer(
+                "⚠️ <b>আপনার একটি উইথড্র রিকোয়েস্ট ইতোমধ্যে প্রসেসিংয়ে আছে।</b>\n\n"
+                "আগের রিকোয়েস্ট সম্পন্ন হলে নতুন রিকোয়েস্ট করুন।",
+                reply_markup=main_kb()
+            )
+            await state.finish()
+            return
+    except Exception as e:
+        log.warning(f"Pending withdraw check error uid={uid}: {e}")
+
     # ── সাথে সাথে balance কেটে নাও (নিরাপদ) ──
     # এতে একই balance দিয়ে বারবার request পাঠানো যাবে না
     deducted = fb_txn_add(uid, balance_delta=-amount)
@@ -1327,14 +1341,14 @@ async def cb_mark_paid(call: types.CallbackQuery):
         return
 
     # Double payment আটকাও
-    if w.get("status") == "success":
+    if w.get("status") in ("paid", "success"):
         await call.message.answer("⚠️ এটা আগেই পেমেন্ট হয়ে গেছে!")
         return
 
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
 
-    fb_update(f"withdrawals/{wid}", {"status": "success", "paidAt": int(time.time() * 1000)})
+    fb_update(f"withdrawals/{wid}", {"status": "paid", "paidAt": int(time.time() * 1000)})
 
     await _notify_user_paid(uid, w)
 
@@ -1430,7 +1444,7 @@ async def watch_admin_paid_notifications():
                     continue
                 # adminPaidNotify আছে মানে Admin Panel থেকে approve হয়েছে
                 notify_uid = w.get("adminPaidNotify")
-                if notify_uid and w.get("status") == "success":
+                if notify_uid and w.get("status") in ("paid", "success"):
                     await _notify_user_paid(notify_uid, w)
                     # field মুছে দাও — আর process না হোক
                     fb_update(f"withdrawals/{wid}", {"adminPaidNotify": None})
@@ -1632,7 +1646,7 @@ async def admin_handler(message: types.Message, state: FSMContext):
     elif "📋 উইথড্র হিস্ট্রি" in txt:
         withs = fb_get("withdrawals") or {}
         done  = [(wid, w) for wid, w in withs.items()
-                 if w.get("status") in ("paid", "rejected")]
+                 if w.get("status") in ("paid", "success", "rejected")]
         done.sort(key=lambda x: x[1].get("createdAt", 0), reverse=True)
 
         if not done:
@@ -1641,7 +1655,7 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
         lines = [f"📋 <b>উইথড্র হিস্ট্রি (সর্বশেষ {min(len(done),15)} টি)</b>\n"]
         for wid, w in done[:15]:
-            icon   = "✅" if w.get("status") == "paid" else "❌"
+            icon   = "✅" if w.get("status") in ("paid", "success") else "❌"
             ts     = w.get("createdAt", 0)
             dt_str = datetime.fromtimestamp(ts / 1000).strftime("%d/%m %H:%M") if ts else "?"
             lines.append(
