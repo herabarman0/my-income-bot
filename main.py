@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ╔══════════════════════════════════════════════════════╗
-# ║          IncomeApp — Telegram Bot (main.py)          ║
-# ║   Firebase Admin SDK  ·  Admin Panel Compatible      ║
+# ║       IncomeApp — Telegram Bot (main.py)             ║
+# ║   Firestore  ·  Optimized Reads  ·  Cache Layer      ║
 # ╚══════════════════════════════════════════════════════╝
 
 import logging
@@ -24,7 +24,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 import firebase_admin
-from firebase_admin import credentials, db as fdb
+from firebase_admin import credentials, firestore
 
 # ═══════════════════════════════════════════════════════
 #   KEEP-ALIVE  (Replit / Render)
@@ -38,7 +38,6 @@ def home():
 
 @flask_app.route('/health')
 def health():
-    """cron-job.org দিয়ে প্রতি ১৪ মিনিটে এই URL-এ ping করুন"""
     return "OK", 200
 
 def run_flask():
@@ -51,15 +50,13 @@ def keep_alive():
 
 # ═══════════════════════════════════════════════════════
 #   CONFIGURATION
-#   Render Secret Files-এ এই তিনটো key যোগ করুন:
+#   Render Secret Files-এ এই key গুলো যোগ করুন:
 #     BOT_TOKEN      → BotFather-এর token
 #     ADMIN_ID       → আপনার Telegram numeric ID
-#     FIREBASE_URL   → https://your-app-default-rtdb.firebaseio.com
 #     FIREBASE_KEYS  → Service Account JSON-এর পুরো কন্টেন্ট
 # ═══════════════════════════════════════════════════════
 API_TOKEN    = os.getenv('BOT_TOKEN', '')
 ADMIN_ID     = int(os.getenv('ADMIN_ID', '0'))
-FIREBASE_URL = os.getenv('FIREBASE_URL', '')
 
 storage = MemoryStorage()
 bot     = Bot(token=API_TOKEN, parse_mode="HTML")
@@ -68,140 +65,159 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log     = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════
-#   FIREBASE ADMIN SDK — SECURE INITIALIZATION
+#   FIRESTORE INITIALIZATION
 #
 #   Render → Environment Variables-এ দিন:
-#     FIREBASE_URL   = https://xxxx-default-rtdb.firebaseio.com
 #     FIREBASE_KEYS  = { Service Account JSON-এর পুরো কন্টেন্ট }
 #
 #   Firebase Console → Project Settings →
 #   Service Accounts → Generate New Private Key
-#   ডাউনলোড করা JSON ফাইলের ভেতরের সব কিছু কপি করুন।
-#
-#   Firebase Rules এখন নিরাপদভাবে এভাবে দিন:
-#   {
-#     "rules": {
-#       ".read":  false,
-#       ".write": false
-#     }
-#   }
-#   Admin SDK এই rules বাইপাস করে কাজ করে। ✅
 # ═══════════════════════════════════════════════════════
 _firebase_keys_raw = os.getenv('FIREBASE_KEYS', '')
 _firebase_ok = False
+db = None  # Firestore client
 
-if _firebase_keys_raw and FIREBASE_URL:
+if _firebase_keys_raw:
     try:
         _cred_dict = json.loads(_firebase_keys_raw)
         _cred      = credentials.Certificate(_cred_dict)
-        firebase_admin.initialize_app(_cred, {'databaseURL': FIREBASE_URL})
+        firebase_admin.initialize_app(_cred)
+        db = firestore.client()
         _firebase_ok = True
-        log.info("✅ Firebase Admin SDK initialized")
+        log.info("✅ Firestore initialized")
     except json.JSONDecodeError as _e:
         log.error(f"❌ FIREBASE_KEYS JSON parse error: {_e}")
-        log.error("FIREBASE_KEYS-এ পুরো JSON কপি করুন, কোনো line break ছাড়া।")
     except Exception as _e:
         log.error(f"❌ Firebase init error: {_e}")
-elif not FIREBASE_URL:
-    log.error("❌ FIREBASE_URL পাওয়া যায়নি! Render-এ Environment Variable যোগ করুন।")
-elif not _firebase_keys_raw:
-    log.error("❌ FIREBASE_KEYS পাওয়া যায়নি! Render-এ Environment Variable যোগ করুন।")
+else:
+    log.error("❌ FIREBASE_KEYS পাওয়া যায়নি!")
 
 # ═══════════════════════════════════════════════════════
-#   FIREBASE HELPERS  (Admin SDK version)
+#   FIRESTORE HELPERS
 # ═══════════════════════════════════════════════════════
-def fb_get(path: str):
+def fs_get_user(uid: str) -> dict | None:
+    """Firestore থেকে একটি ইউজার আনো।"""
     try:
-        return fdb.reference(path).get()
+        doc = db.collection("users").document(uid).get()
+        if doc.exists:
+            return doc.to_dict()
+        return None
     except Exception as e:
-        log.error(f"fb_get error [{path}]: {e}")
+        log.error(f"fs_get_user error [{uid}]: {e}")
         return None
 
-def fb_put(path: str, data):
+def fs_set_user(uid: str, data: dict):
+    """Firestore-এ নতুন ইউজার সেট করো।"""
     try:
-        fdb.reference(path).set(data)
+        db.collection("users").document(uid).set(data)
     except Exception as e:
-        log.error(f"fb_put error [{path}]: {e}")
+        log.error(f"fs_set_user error [{uid}]: {e}")
 
-def fb_update(path: str, data: dict):
+def fs_update_user(uid: str, fields: dict):
+    """Firestore-এ ইউজার আপডেট করো।"""
     try:
-        fdb.reference(path).update(data)
+        db.collection("users").document(uid).update(fields)
     except Exception as e:
-        log.error(f"fb_update error [{path}]: {e}")
+        log.error(f"fs_update_user error [{uid}]: {e}")
 
-def fb_push(path: str, data: dict):
+def fs_get(collection: str, doc_id: str) -> dict | None:
+    """যেকোনো collection থেকে একটি document আনো।"""
     try:
-        new_ref = fdb.reference(path).push(data)
-        return new_ref.key
+        doc = db.collection(collection).document(doc_id).get()
+        return doc.to_dict() if doc.exists else None
     except Exception as e:
-        log.error(f"fb_push error [{path}]: {e}")
+        log.error(f"fs_get error [{collection}/{doc_id}]: {e}")
         return None
 
-def fb_delete(path: str):
+def fs_set(collection: str, doc_id: str, data: dict):
+    """যেকোনো collection-এ document সেট করো।"""
     try:
-        fdb.reference(path).delete()
+        db.collection(collection).document(doc_id).set(data)
     except Exception as e:
-        log.error(f"fb_delete error [{path}]: {e}")
+        log.error(f"fs_set error [{collection}/{doc_id}]: {e}")
 
-def fb_txn_add(uid: str, balance_delta: float = 0, points_delta: int = 0) -> bool:
+def fs_update(collection: str, doc_id: str, fields: dict):
+    """যেকোনো collection-এ document আপডেট করো।"""
+    try:
+        db.collection(collection).document(doc_id).update(fields)
+    except Exception as e:
+        log.error(f"fs_update error [{collection}/{doc_id}]: {e}")
+
+def fs_delete(collection: str, doc_id: str):
+    """যেকোনো collection থেকে document মুছো।"""
+    try:
+        db.collection(collection).document(doc_id).delete()
+    except Exception as e:
+        log.error(f"fs_delete error [{collection}/{doc_id}]: {e}")
+
+def fs_add(collection: str, data: dict) -> str | None:
+    """collection-এ auto-ID দিয়ে document যোগ করো।"""
+    try:
+        _, ref = db.collection(collection).add(data)
+        return ref.id
+    except Exception as e:
+        log.error(f"fs_add error [{collection}]: {e}")
+        return None
+
+def fs_txn_add(uid: str, balance_delta: float = 0, points_delta: int = 0) -> bool:
     """
     Race Condition-safe balance ও points আপডেট।
-
-    Firebase transaction ব্যবহার করে — একই সময়ে
-    দুটো আপডেট এলে একটা retry করে, কোনো ডেটা হারায় না।
-
-    শুধু balance বা points বদলানোর দরকার হলে
-    বাকিটা 0 রাখুন।
-
-    Returns True if successful, False otherwise.
+    Firestore transaction ব্যবহার করে।
     """
     if balance_delta == 0 and points_delta == 0:
         return True
     try:
-        ref = fdb.reference(f"users/{uid}")
+        user_ref = db.collection("users").document(uid)
 
-        def _txn_fn(current_data):
-            if current_data is None:
-                return None                            # ইউজার নেই — abort
+        @firestore.transactional
+        def _update_in_txn(transaction, user_ref):
+            snapshot = user_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return False
+            data = snapshot.to_dict()
+            updates = {}
             if balance_delta != 0:
-                current_data["balance"] = round(
-                    max(0, current_data.get("balance", 0) + balance_delta), 2
-                )
+                new_bal = round(max(0, data.get("balance", 0) + balance_delta), 2)
+                updates["balance"] = new_bal
             if points_delta != 0:
-                current_data["points"] = max(
-                    0, current_data.get("points", 0) + points_delta
-                )
-            return current_data
+                new_pts = max(0, data.get("points", 0) + points_delta)
+                updates["points"] = new_pts
+            transaction.update(user_ref, updates)
+            return True
 
-        result = ref.transaction(_txn_fn)
-        cache_invalidate_user(uid)                     # ক্যাশ মুছো
+        transaction = db.transaction()
+        result = _update_in_txn(transaction, user_ref)
+        cache_invalidate_user(uid)
         log.debug(f"txn_add uid={uid} bal={balance_delta:+} pts={points_delta:+}")
-        return result is not None
+        return result
     except Exception as e:
-        log.error(f"fb_txn_add error uid={uid}: {e}")
+        log.error(f"fs_txn_add error uid={uid}: {e}")
         return False
 
-# ═══════════════════════════════════════════════════════
-#   LOCAL CACHE  (RAM — no TTL, invalidate-on-write)
-#
-#   শুধু  users/{uid}  নোড ক্যাশ করা হয়।
-#   যখনই কোনো ফাংশন  users/{uid}  আপডেট করে,
-#   সেই UID-এর ক্যাশ সাথে সাথে মুছে যায়।
-#   পরের রিড-এ নতুন ডেটা Firebase থেকে আসে
-#   এবং আবার ক্যাশে জমা হয়।
-# ═══════════════════════════════════════════════════════
+def increment_refer_stat(referrer_uid: str):
+    """
+    রেফার হলে referStats collection-এ +১ করে।
+    টপ রেফারার দেখাতে পুরো users স্ক্যান লাগবে না।
+    """
+    try:
+        ref = db.collection("referStats").document(referrer_uid)
+        ref.set({"count": firestore.Increment(1)}, merge=True)
+    except Exception as e:
+        log.error(f"increment_refer_stat error: {e}")
 
-# ── ইউজার ক্যাশ ──
-MAX_CACHE_SIZE = 5000                              # ফ্রি tier-এ ৫০০০ ইউজার RAM-এ রাখা যাবে
-USER_CACHE_TTL = 120                               # ১২০ সেকেন্ড — Firebase read কম হবে
-_user_cache: dict = {}                             # { uid: {"data":{}, "ts":float} }
+# ═══════════════════════════════════════════════════════
+#   LOCAL CACHE  (RAM — TTL 120 সেকেন্ড)
+# ═══════════════════════════════════════════════════════
+MAX_CACHE_SIZE = 5000
+USER_CACHE_TTL = 120
+_user_cache: dict = {}
 
 def cache_get_user(uid: str):
     entry = _user_cache.get(uid)
     if entry is None:
         return None
     if (time.time() - entry["ts"]) > USER_CACHE_TTL:
-        del _user_cache[uid]                       # TTL শেষ — মুছে দাও
+        del _user_cache[uid]
         return None
     return entry["data"]
 
@@ -222,53 +238,39 @@ def cache_invalidate_user(uid: str):
 def get_user(uid: str) -> dict | None:
     """
     RAM চেক → TTL ১২০ সেকেন্ড।
-    TTL শেষ হলে Firebase থেকে fresh data আনে।
-    Bot নিজে update করলে cache_invalidate_user() সাথে সাথে মুছে দেয়।
-    Admin Panel থেকে edit করলে সর্বোচ্চ ১২০ সেকেন্ডে দেখাবে।
+    Cache miss হলে Firestore থেকে আনে।
     """
     cached = cache_get_user(uid)
     if cached is not None:
         return cached
-    log.debug(f"Cache MISS: {uid} → Firebase read")
-    data = fb_get(f"users/{uid}")
+    log.debug(f"Cache MISS: {uid} → Firestore read")
+    data = fs_get_user(uid)
     if data:
         cache_set_user(uid, data)
     return data
 
-# ── cache-aware write helpers ──
 def update_user(uid: str, fields: dict):
-    """Firebase আপডেট করে, তারপর ক্যাশ invalidate করে।"""
-    fb_update(f"users/{uid}", fields)
+    """Firestore আপডেট + cache invalidate।"""
+    fs_update_user(uid, fields)
     cache_invalidate_user(uid)
 
 def put_user(uid: str, data: dict):
-    """Firebase-এ নতুন ইউজার রাখে, তারপর ক্যাশ সেট করে।"""
-    fb_put(f"users/{uid}", data)
+    """Firestore-এ নতুন ইউজার + cache set।"""
+    fs_set_user(uid, data)
     cache_set_user(uid, data)
 
 # ═══════════════════════════════════════════════════════
-#   SETTINGS CACHE  (TTL-based — ৬০ সেকেন্ড পর refresh)
-#
-#   settings সবার জন্য একই — তাই একটাই ক্যাশ।
-#   প্রতি ৬০ সেকেন্ডে একবার Firebase থেকে আনে।
-#   ৫০,০০০ ইউজার active থাকলেও settings-এর
-#   Firebase read প্রতি মিনিটে মাত্র ১ বার।
+#   SETTINGS CACHE  (TTL 60 সেকেন্ড)
 # ═══════════════════════════════════════════════════════
-SETTINGS_TTL                  = 60                # সেকেন্ড
-_settings_cache: dict         = {"data": None, "ts": 0.0}
+SETTINGS_TTL = 60
+_settings_cache: dict = {"data": None, "ts": 0.0}
 
 def get_settings() -> dict:
-    """
-    ৬০ সেকেন্ডের মধ্যে একাধিক call হলে
-    Firebase-এ না গিয়ে RAM থেকে দেয়।
-    """
     now = time.time()
     if _settings_cache["data"] and (now - _settings_cache["ts"]) < SETTINGS_TTL:
-        log.debug("Settings cache HIT")
         return _settings_cache["data"]
 
-    log.debug("Settings cache MISS → Firebase read")
-    s = fb_get("settings") or {}
+    s = fs_get("config", "settings") or {}
     result = {
         "bkash":      s.get("bkash",      "01XXXXXXXXX"),
         "nagad":      s.get("nagad",      "01XXXXXXXXX"),
@@ -282,20 +284,15 @@ def get_settings() -> dict:
         "earn1":      s.get("earn1",      20),
         "earn2":      s.get("earn2",      25),
         "earn3":      s.get("earn3",      30),
-        "dailyBonus": s.get("dailyBonus", 10),   # ← ডেইলি বোনাস ডিফল্ট ১০ পয়েন্ট (এখানে বদলান)
+        "dailyBonus": s.get("dailyBonus", 10),
     }
     _settings_cache["data"] = result
     _settings_cache["ts"]   = now
     return result
 
 def invalidate_settings_cache():
-    """
-    প্রয়োজনে manually settings cache মুছতে।
-    সাধারণত TTL-ই যথেষ্ট।
-    """
     _settings_cache["data"] = None
     _settings_cache["ts"]   = 0.0
-    log.debug("Settings cache invalidated")
 
 # ═══════════════════════════════════════════════════════
 #   LEVEL & EARN LOGIC
@@ -320,13 +317,13 @@ def generate_refer_code(name: str) -> str:
     return prefix + suffix
 
 def is_refer_code_unique(code: str) -> bool:
-    """Firebase indexed query — পুরো users লোড করে না।"""
+    """Firestore indexed query — পুরো users স্ক্যান করে না।"""
     try:
-        result = fdb.reference("users").order_by_child("referCode").equal_to(code).get()
-        return not result   # খালি মানে unique
+        docs = db.collection("users").where("referCode", "==", code).limit(1).get()
+        return len(docs) == 0
     except Exception as e:
         log.error(f"is_refer_code_unique error: {e}")
-        return True         # error হলে unique ধরো
+        return True
 
 def make_unique_refer_code(name: str) -> str:
     for _ in range(20):
@@ -432,7 +429,6 @@ def paid_reject_kb(wid: str):
 #   MIDDLEWARE — app on/off check
 # ═══════════════════════════════════════════════════════
 async def app_check(uid: str, message: types.Message) -> bool:
-    """Returns True if app is ON and user is allowed."""
     s = get_settings()
     if not s["appOn"]:
         await message.answer("🔧 অ্যাপটি সাময়িকভাবে মেইনটেন্যান্সে আছে। কিছুক্ষণ পর আবার চেষ্টা করুন।")
@@ -452,29 +448,26 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer("🔧 অ্যাপটি সাময়িক মেইনটেন্যান্সে। পরে আসুন।")
         return
 
-    # Admin shortcut
     if message.from_user.id == ADMIN_ID:
         await message.answer(
-            "👑 <b>অ্যাডমিন প্যানেলে স্বাগতম!</b>\n\n"
-            "নিচের মেনু থেকে যেকোনো অপশন বেছে নিন।",
+            "👑 <b>অ্যাডমিন প্যানেলে স্বাগতম!</b>\n\nনিচের মেনু থেকে যেকোনো অপশন বেছে নিন।",
             reply_markup=admin_kb()
         )
         return
 
+    # ── cache থেকে আনো — Firestore read বাঁচাতে ──
     user = get_user(uid)
 
-    # ── NEW USER ──
     if not user:
         if not s["regOn"]:
             await message.answer("❌ নতুন নিবন্ধন সাময়িকভাবে বন্ধ আছে।")
             return
         args = message.get_args()
         ref_by = args if args else None
-        # Verify ref code exists — indexed query, পুরো users লোড করে না
         if ref_by:
             try:
-                match = fdb.reference("users").order_by_child("referCode").equal_to(ref_by).get()
-                if not match:
+                docs = db.collection("users").where("referCode", "==", ref_by).limit(1).get()
+                if not docs:
                     ref_by = None
             except Exception:
                 ref_by = None
@@ -490,17 +483,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer(welcome, reply_markup=ReplyKeyboardRemove())
         return
 
-    # ── EXISTING USER ──
     st = user.get("status", "pending")
 
     if st == "banned":
         await message.answer("🚫 আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে। সাপোর্টে যোগাযোগ করুন।")
         return
-
     if st in ("pending", "new"):
         await _show_payment_screen(message, uid, user, s)
         return
-
     if st == "review":
         await message.answer(
             "⏳ <b>আপনার পেমেন্ট রিভিউতে আছে।</b>\n\n"
@@ -508,7 +498,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "📞 দ্রুত যোগাযোগ: /support"
         )
         return
-
     if st == "rejected":
         await message.answer(
             "❌ <b>আপনার পেমেন্ট রিজেক্ট হয়েছে।</b>\n\n"
@@ -516,7 +505,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         return
 
-    # active
     await _show_home(message, uid, user, s)
 
 
@@ -560,67 +548,39 @@ async def _show_home(message, uid, user, s):
 async def reg_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
 
-    # ── ফরম্যাট চেক ──
     if not phone.isdigit():
-        await message.answer(
-            "❌ ফোন নম্বরে শুধু সংখ্যা থাকবে, কোনো স্পেস বা '-' নয়।\n"
-            "উদাহরণ: <code>01712345678</code>"
-        )
+        await message.answer("❌ ফোন নম্বরে শুধু সংখ্যা থাকবে।\nউদাহরণ: <code>01712345678</code>")
         return
     if len(phone) != 11:
-        await message.answer(
-            f"❌ ফোন নম্বর ঠিক ১১ সংখ্যার হতে হবে।\n"
-            f"আপনি দিয়েছেন {len(phone)} সংখ্যা।\n"
-            f"উদাহরণ: <code>01712345678</code>"
-        )
+        await message.answer(f"❌ ফোন নম্বর ঠিক ১১ সংখ্যার হতে হবে।\nআপনি দিয়েছেন {len(phone)} সংখ্যা।")
         return
     if not phone.startswith("01"):
-        await message.answer(
-            "❌ বাংলাদেশের নম্বর <b>01</b> দিয়ে শুরু হওয়া উচিত।\n"
-            "উদাহরণ: <code>01712345678</code>"
-        )
+        await message.answer("❌ বাংলাদেশের নম্বর <b>01</b> দিয়ে শুরু হওয়া উচিত।")
         return
     valid_prefixes = ("011","013","014","015","016","017","018","019")
     if not any(phone.startswith(p) for p in valid_prefixes):
-        await message.answer(
-            "❌ সঠিক অপারেটর কোড দিন (011-019)।\n"
-            "উদাহরণ: <code>01712345678</code>"
-        )
+        await message.answer("❌ সঠিক অপারেটর কোড দিন (011-019)।")
         return
 
-    # ── Duplicate চেক — indexed query ──
+    # Duplicate চেক — Firestore indexed query
     try:
-        match_phone = fdb.reference("users").order_by_child("phone").equal_to(phone).get()
-    except Exception:
-        match_phone = None
-
-    if match_phone and isinstance(match_phone, dict):
-        vals = list(match_phone.values())
-        if vals:
-            existing = vals[0]
+        docs = db.collection("users").where("phone", "==", phone).limit(1).get()
+        if docs:
+            existing = docs[0].to_dict()
             st = existing.get("status", "pending")
             if st == "active":
-                await message.answer(
-                    "❌ এই ফোন নম্বরে আগেই একটি একটিভ অ্যাকাউন্ট আছে।\n"
-                    "লগইন করতে /start দিন।"
-                )
+                await message.answer("❌ এই ফোন নম্বরে আগেই একটি একটিভ অ্যাকাউন্ট আছে।")
             elif st in ("pending", "review", "new"):
-                await message.answer(
-                    "⚠️ এই ফোন নম্বরে একটি অ্যাকাউন্ট পেমেন্ট ভেরিফিকেশনের অপেক্ষায় আছে।\n"
-                    "স্ট্যাটাস দেখতে /status দিন।"
-                )
+                await message.answer("⚠️ এই ফোন নম্বরে একটি অ্যাকাউন্ট ভেরিফিকেশনের অপেক্ষায় আছে।")
             else:
-                await message.answer(
-                    "❌ এই ফোন নম্বর দিয়ে অ্যাকাউন্ট তৈরি করা যাবে না।\n"
-                    "সাপোর্টে যোগাযোগ করুন: /support"
-                )
+                await message.answer("❌ এই ফোন নম্বর দিয়ে অ্যাকাউন্ট তৈরি করা যাবে না।")
             return
+    except Exception:
+        pass
 
     await state.update_data(phone=phone)
     await Reg.ref_code.set()
-    await message.answer(
-        "🎟 বন্ধুর <b>রেফার কোড</b> থাকলে লিখুন, না থাকলে <b>skip</b> লিখুন:"
-    )
+    await message.answer("🎟 বন্ধুর <b>রেফার কোড</b> থাকলে লিখুন, না থাকলে <b>skip</b> লিখুন:")
 
 @dp.message_handler(state=Reg.ref_code)
 async def reg_ref_code(message: types.Message, state: FSMContext):
@@ -632,21 +592,20 @@ async def reg_ref_code(message: types.Message, state: FSMContext):
     referred_by_uid = None
     if code != "SKIP" and code:
         try:
-            match_ref = fdb.reference("users").order_by_child("referCode").equal_to(code).get()
+            docs = db.collection("users").where("referCode", "==", code).limit(1).get()
+            if docs:
+                referred_by_uid = docs[0].id
+            else:
+                await message.answer("⚠️ রেফার কোড পাওয়া যায়নি। Skip করুন বা সঠিক কোড দিন:")
+                return
         except Exception:
-            match_ref = None
-        if match_ref:
-            referred_by_uid = list(match_ref.keys())[0]
-        else:
-            await message.answer("⚠️ রেফার কোড পাওয়া যায়নি। Skip করুন বা সঠিক কোড দিন:")
-            return
+            pass
 
-    # Override from /start args if present
     if data.get("referred_by") and not referred_by_uid:
         try:
-            match_ref2 = fdb.reference("users").order_by_child("referCode").equal_to(data["referred_by"]).get()
-            if match_ref2:
-                referred_by_uid = list(match_ref2.keys())[0]
+            docs = db.collection("users").where("referCode", "==", data["referred_by"]).limit(1).get()
+            if docs:
+                referred_by_uid = docs[0].id
         except Exception:
             pass
 
@@ -663,9 +622,8 @@ async def reg_ref_code(message: types.Message, state: FSMContext):
         "createdAt":   int(time.time() * 1000),
         "deviceId":    f"tg_{uid}",
     }
-    put_user(uid, user_data)   # Firebase write + cache set
+    put_user(uid, user_data)
     await state.finish()
-
     await _show_payment_screen(message, uid, user_data, s)
 
 # ═══════════════════════════════════════════════════════
@@ -710,48 +668,23 @@ async def cmd_pay(message: types.Message, state: FSMContext):
 async def pay_method(call: types.CallbackQuery, state: FSMContext):
     method = call.data.split("_")[1]
     await state.update_data(method=method)
-
     await Pay.sender_phone.set()
     await call.message.answer(
         f"✅ মেথড: <b>{'বিকাশ' if method=='bkash' else 'নগদ'}</b>\n\n"
-        f"📱 যে নম্বর থেকে টাকা পাঠিয়েছেন সেই <b>ফোন নম্বর</b> দিন (১১ সংখ্যা):\n"
-        f"উদাহরণ: <code>01712345678</code>"
+        f"📱 যে নম্বর থেকে টাকা পাঠিয়েছেন সেই <b>ফোন নম্বর</b> দিন (১১ সংখ্যা):"
     )
     await call.answer()
-
 
 @dp.message_handler(state=Pay.sender_phone)
 async def pay_sender_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
-
-    # ── ফরম্যাট চেক ──
-    if not phone.isdigit():
-        await message.answer(
-            "❌ ফোন নম্বরে শুধু সংখ্যা থাকবে, কোনো স্পেস বা '-' নয়।\n"
-            "উদাহরণ: <code>01712345678</code>"
-        )
-        return
-    if len(phone) != 11:
-        await message.answer(
-            f"❌ ফোন নম্বর ঠিক ১১ সংখ্যার হতে হবে।\n"
-            f"আপনি দিয়েছেন {len(phone)} সংখ্যা।\n"
-            f"উদাহরণ: <code>01712345678</code>"
-        )
-        return
-    if not phone.startswith("01"):
-        await message.answer(
-            "❌ বাংলাদেশের নম্বর <b>01</b> দিয়ে শুরু হওয়া উচিত।\n"
-            "উদাহরণ: <code>01712345678</code>"
-        )
+    if not phone.isdigit() or len(phone) != 11 or not phone.startswith("01"):
+        await message.answer("❌ সঠিক ১১ সংখ্যার নম্বর দিন। উদাহরণ: <code>01712345678</code>")
         return
     valid_prefixes = ("011", "013", "014", "015", "016", "017", "018", "019")
     if not any(phone.startswith(p) for p in valid_prefixes):
-        await message.answer(
-            "❌ সঠিক অপারেটর কোড দিন (011-019)।\n"
-            "উদাহরণ: <code>01712345678</code>"
-        )
+        await message.answer("❌ সঠিক অপারেটর কোড দিন (011-019)।")
         return
-
     await state.update_data(sender_phone=phone)
     await Pay.txn_id.set()
     await message.answer(
@@ -760,25 +693,14 @@ async def pay_sender_phone(message: types.Message, state: FSMContext):
     )
 
 def _validate_txn(txn: str, method: str) -> tuple[bool, str]:
-    """
-    Validate transaction ID silently.
-    Rules (hidden from user):
-      bkash: exactly 10 chars, must contain both letters and digits
-      nagad:  exactly 8 chars, must contain both letters and digits
-    Returns (is_valid, error_message)
-    """
     expected = 10 if method == "bkash" else 8
     txn_up   = txn.upper()
-
     has_letter = any(c.isalpha() for c in txn_up)
     has_digit  = any(c.isdigit() for c in txn_up)
     is_alnum   = all(c.isalnum() for c in txn_up)
-
     if not txn or len(txn_up) != expected:
         return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
-    if not is_alnum:
-        return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
-    if not has_letter or not has_digit:
+    if not is_alnum or not has_letter or not has_digit:
         return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
     return True, ""
 
@@ -795,54 +717,49 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         await message.answer(err_msg)
         return
 
-    # ── Duplicate TxnID চেক — indexed query, পুরো verifications লোড করে না ──
+    # Duplicate TxnID চেক — Firestore indexed query
     txn_upper = txn.upper()
     try:
-        match_txn = fdb.reference("verifications").order_by_child("transactionId").equal_to(txn_upper).get()
+        docs = db.collection("verifications").where("transactionId", "==", txn_upper).limit(1).get()
+        if docs:
+            await message.answer(
+                "❌ এই ট্রান্জেকশন আইডিটি আগেই ব্যবহার করা হয়েছে।\n"
+                "সঠিক TxnID দিন বা সাপোর্টে যোগাযোগ করুন: /support"
+            )
+            return
     except Exception:
-        match_txn = None
-    if match_txn:
-        await message.answer(
-            "❌ এই ট্রান্জেকশন আইডিটি আগেই ব্যবহার করা হয়েছে।\n"
-            "সঠিক TxnID দিন বা সাপোর্টে যোগাযোগ করুন: /support"
-        )
-        return
+        pass
 
     user = get_user(uid) or {}
     s    = get_settings()
 
-    # Save verification request
     ver_data = {
         "uid":           uid,
         "name":          user.get("name", "?"),
         "phone":         user.get("phone", "?"),
         "senderPhone":   sender_phone,
         "method":        method,
-        "transactionId": txn,
+        "transactionId": txn_upper,
         "status":        "pending",
         "submittedAt":   int(time.time() * 1000),
     }
-    vid = fb_push("verifications", ver_data)
+    vid = fs_add("verifications", ver_data)
     update_user(uid, {"status": "review"})
 
-    # Notify admin via Telegram
     admin_text = (
         f"🔔 <b>নতুন ভেরিফিকেশন রিকোয়েস্ট</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 নাম:  {user.get('name','?')}\n"
         f"📞 রেজিস্ট্রেশন ফোন: {user.get('phone','?')}\n"
-        f"📱 পেমেন্ট পাঠানো নম্বর: <code>{sender_phone}</code>\n"
+        f"📱 পেমেন্ট নম্বর: <code>{sender_phone}</code>\n"
         f"💳 মেথড: {method.upper()}\n"
-        f"🆔 TxnID: <code>{txn}</code>\n"
+        f"🆔 TxnID: <code>{txn_upper}</code>\n"
         f"🕐 সময়: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"UID: <code>{uid}</code>  |  VID: <code>{vid}</code>"
     )
     try:
-        await bot.send_message(
-            ADMIN_ID, admin_text,
-            reply_markup=approve_reject_kb(f"{uid}|{vid}", "ver")
-        )
+        await bot.send_message(ADMIN_ID, admin_text, reply_markup=approve_reject_kb(f"{uid}|{vid}", "ver"))
     except Exception as e:
         log.warning(f"Admin notify error: {e}")
 
@@ -859,35 +776,38 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
 # ═══════════════════════════════════════════════════════
 @dp.callback_query_handler(lambda c: c.data.startswith("approve_ver_"))
 async def cb_approve_ver(call: types.CallbackQuery):
-    # শুধু Admin approve করতে পারবে
     if call.from_user.id != ADMIN_ID:
         await call.answer("শুধু অ্যাডমিন এই কাজ করতে পারবেন!", show_alert=True)
         return
 
-    # ── আগেই answer করো — Telegram timeout এড়াতে ──
     await call.answer("⏳ প্রসেস হচ্ছে...")
 
-    parts  = call.data.replace("approve_ver_", "").split("|")
-    uid    = parts[0]
-    vid    = parts[1] if len(parts) > 1 else None
-    s      = get_settings()
+    parts = call.data.replace("approve_ver_", "").split("|")
+    uid   = parts[0]
+    vid   = parts[1] if len(parts) > 1 else None
+    s     = get_settings()
 
     update_user(uid, {"status": "active", "verifiedAt": int(time.time() * 1000)})
     if vid:
-        fb_update(f"verifications/{vid}", {"status": "approved", "approvedAt": int(time.time() * 1000)})
+        fs_update("verifications", vid, {"status": "approved", "approvedAt": int(time.time() * 1000)})
 
-    # stats counter +1
+    # stats counter — Firestore Increment (race-safe)
     try:
-        cur = fb_get("stats/active_users") or 0
-        fb_put("stats/active_users", cur + 1)
+        db.collection("stats").document("main").set(
+            {"active_users": firestore.Increment(1)}, merge=True
+        )
     except Exception:
         pass
 
     # আজকের revenue আপডেট
-    today_key  = datetime.now().strftime("%Y-%m-%d")
-    fee_now    = s.get("fee", 50)
-    prev_rev   = fb_get(f"dailyRevenue/{today_key}") or 0
-    fb_put(f"dailyRevenue/{today_key}", prev_rev + fee_now)
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    fee_now   = s.get("fee", 50)
+    try:
+        db.collection("dailyRevenue").document(today_key).set(
+            {"amount": firestore.Increment(fee_now)}, merge=True
+        )
+    except Exception:
+        pass
 
     # Credit referrer
     user = get_user(uid) or {}
@@ -897,7 +817,9 @@ async def cb_approve_ver(call: types.CallbackQuery):
         lvl      = get_level(ref_user.get("points", 0), s)
         earn     = get_earn(lvl, s)
         REF_POINTS = 100
-        fb_txn_add(ref_uid, balance_delta=earn, points_delta=REF_POINTS)
+        fs_txn_add(ref_uid, balance_delta=earn, points_delta=REF_POINTS)
+        # referStats নোড আপডেট — টপ রেফারারের জন্য
+        increment_refer_stat(ref_uid)
         try:
             await bot.send_message(
                 int(ref_uid),
@@ -909,7 +831,6 @@ async def cb_approve_ver(call: types.CallbackQuery):
         except Exception:
             pass
 
-    # Notify new user
     try:
         await bot.send_message(
             int(uid),
@@ -920,19 +841,12 @@ async def cb_approve_ver(call: types.CallbackQuery):
     except Exception:
         pass
 
-    # ── বাটন সরিয়ে approved text দেখাও ──
-    # aiogram v2-তে html_text নেই — তাই নতুন text build করো
     old_text = call.message.text or ""
     new_text = old_text + f"\n\n✅ অ্যাপ্রুভড — {datetime.now().strftime('%d/%m %H:%M')}"
     try:
         await call.message.edit_text(new_text, reply_markup=None)
     except Exception:
-        # edit না হলে নতুন message পাঠাও
-        await call.message.answer(
-            f"✅ <b>অ্যাপ্রুভড!</b>\n"
-            f"UID: <code>{uid}</code>\n"
-            f"সময়: {datetime.now().strftime('%d/%m %H:%M')}"
-        )
+        await call.message.answer(f"✅ <b>অ্যাপ্রুভড!</b>\nUID: <code>{uid}</code>")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("reject_ver_"))
@@ -949,7 +863,7 @@ async def cb_reject_ver(call: types.CallbackQuery):
 
     update_user(uid, {"status": "rejected"})
     if vid:
-        fb_update(f"verifications/{vid}", {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
+        fs_update("verifications", vid, {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
 
     try:
         await bot.send_message(
@@ -966,11 +880,7 @@ async def cb_reject_ver(call: types.CallbackQuery):
     try:
         await call.message.edit_text(new_text, reply_markup=None)
     except Exception:
-        await call.message.answer(
-            f"❌ <b>রিজেক্টেড!</b>\n"
-            f"UID: <code>{uid}</code>\n"
-            f"সময়: {datetime.now().strftime('%d/%m %H:%M')}"
-        )
+        await call.message.answer(f"❌ <b>রিজেক্টেড!</b>\nUID: <code>{uid}</code>")
 
 # ═══════════════════════════════════════════════════════
 #   MAIN MENU HANDLERS
@@ -987,11 +897,8 @@ async def menu_handler(message: types.Message, state: FSMContext):
     if not await app_check(uid, message):
         return
 
-    # সবসময় fresh data আনো — cache stale status এড়াতে
-    # ── EXISTING USER — সবসময় Firebase থেকে fresh ──
-    user = fb_get(f"users/{uid}")
-    if user:
-        cache_set_user(uid, user)
+    # ✅ cache থেকে আনো — সরাসরি Firestore নয়
+    user = get_user(uid)
     if not user:
         await message.answer("প্রথমে /start দিন।")
         return
@@ -999,7 +906,6 @@ async def menu_handler(message: types.Message, state: FSMContext):
         await message.answer("🚫 আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে।")
         return
     if user.get("status") != "active":
-        # active না হলে start flow-এ পাঠাও
         await cmd_start(message, state)
         return
 
@@ -1008,20 +914,16 @@ async def menu_handler(message: types.Message, state: FSMContext):
 
     # ── হোম ──
     if txt == "🏠 হোম":
-        # সর্বদা fresh data আনো — balance/points সাথে সাথে দেখাবে
-        fresh = fb_get(f"users/{uid}")
-        if fresh:
-            cache_set_user(uid, fresh)
-            user = fresh
+        # cache invalidate করে fresh data আনো
+        cache_invalidate_user(uid)
+        user = get_user(uid) or user
         await _show_home(message, uid, user, s)
 
     # ── প্রোফাইল ──
     elif txt == "📊 আমার প্রোফাইল":
-        # সর্বদা fresh data — Admin edit সাথে সাথে দেখাবে
-        fresh = fb_get(f"users/{uid}")
-        if fresh:
-            cache_set_user(uid, fresh)
-            user = fresh
+        # cache invalidate করে fresh আনো
+        cache_invalidate_user(uid)
+        user = get_user(uid) or user
 
         pts  = user.get("points", 0)
         bal  = user.get("balance", 0)
@@ -1029,26 +931,33 @@ async def menu_handler(message: types.Message, state: FSMContext):
         earn = get_earn(lvl, s)
         minw = get_min_withdraw(lvl)
 
-        # Refer stats — indexed query
+        # ✅ referStats থেকে আনো — পুরো users স্ক্যান নয়
         try:
-            ref_matches = fdb.reference("users").order_by_child("referredBy").equal_to(uid).get() or {}
+            ref_stat_doc = db.collection("referStats").document(uid).get()
+            total_refs = ref_stat_doc.to_dict().get("count", 0) if ref_stat_doc.exists else 0
         except Exception:
-            ref_matches = {}
-        total_refs  = len(ref_matches)
-        active_refs = sum(1 for u in ref_matches.values() if u.get("status") == "active")
+            total_refs = 0
+
+        # active refs — শুধু এই ইউজারের রেফার করা active users গণনা
+        try:
+            active_docs = db.collection("users")\
+                .where("referredBy", "==", uid)\
+                .where("status", "==", "active")\
+                .select([])\
+                .get()
+            active_refs = len(active_docs)
+        except Exception:
+            active_refs = 0
 
         me       = await bot.get_me()
         ref_link = f"https://t.me/{me.username}?start={user.get('referCode','')}"
 
-        # Level progress
         lvl2 = s["lvl2Start"]
         lvl3 = s["lvl3Start"]
         if lvl == 1:
-            next_pts  = lvl2 - pts
-            next_info = f"লেভেল ২ তে আর {next_pts} পয়েন্ট"
+            next_info = f"লেভেল ২ তে আর {lvl2 - pts} পয়েন্ট"
         elif lvl == 2:
-            next_pts  = lvl3 - pts
-            next_info = f"লেভেল ৩ তে আর {next_pts} পয়েন্ট"
+            next_info = f"লেভেল ৩ তে আর {lvl3 - pts} পয়েন্ট"
         else:
             next_info = "সর্বোচ্চ লেভেলে আছেন 🏆"
 
@@ -1092,7 +1001,7 @@ async def menu_handler(message: types.Message, state: FSMContext):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton(
             "📤 শেয়ার করুন",
-            url=f"https://t.me/share/url?url={ref_link}&text=IncomeApp-এ যোগ দিন, রেফার করে আয় করুন!%0A%0Aআমার রেফার কোড: {ref_code}"
+            url=f"https://t.me/share/url?url={ref_link}&text=IncomeApp-এ যোগ দিন!%0Aরেফার কোড: {ref_code}"
         ))
         await message.answer(text, reply_markup=kb)
 
@@ -1104,12 +1013,10 @@ async def menu_handler(message: types.Message, state: FSMContext):
 
         if last_claim >= today_ts:
             await message.answer(
-                f"☀️ <b>ডেইলি বোনাস</b>\n\n"
-                f"আজকের বোনাস ইতোমধ্যে নেওয়া হয়েছে।\n"
-                f"কাল আবার আসুন! ⏰"
+                f"☀️ <b>ডেইলি বোনাস</b>\n\nআজকের বোনাস ইতোমধ্যে নেওয়া হয়েছে।\nকাল আবার আসুন! ⏰"
             )
         else:
-            fb_txn_add(uid, points_delta=bonus)        # ← race-safe
+            fs_txn_add(uid, points_delta=bonus)
             update_user(uid, {"lastDailyBonus": int(time.time() * 1000)})
             new_pts = user.get("points", 0) + bonus
             await message.answer(
@@ -1143,21 +1050,24 @@ async def menu_handler(message: types.Message, state: FSMContext):
             reply_markup=method_kb()
         )
 
-    # ── পেমেন্ট হিস্ট্রি ──
+    # ── পেমেন্ট হিস্ট্রি — ✅ শুধু এই ইউজারের ১০টা আনো ──
     elif txt == "📋 পেমেন্ট হিস্ট্রি":
-        withdrawals = fb_get("withdrawals") or {}
-        my_list = [
-            w for w in withdrawals.values()
-            if w.get("uid") == uid
-        ]
-        my_list.sort(key=lambda x: x.get("requestedAt", 0), reverse=True)
+        try:
+            docs = db.collection("withdrawals")\
+                .where("uid", "==", uid)\
+                .order_by("requestedAt", direction=firestore.Query.DESCENDING)\
+                .limit(10)\
+                .get()
+            my_list = [d.to_dict() for d in docs]
+        except Exception:
+            my_list = []
 
         if not my_list:
             await message.answer("📋 <b>পেমেন্ট হিস্ট্রি</b>\n\nকোনো উত্তোলনের রেকর্ড নেই।")
             return
 
         lines = ["📋 <b>পেমেন্ট হিস্ট্রি</b>\n━━━━━━━━━━━━━━━━━━"]
-        for w in my_list[:10]:
+        for w in my_list:
             st_icon = "✅" if w.get("status") in ("paid", "success") else "⏳" if w.get("status") == "pending" else "❌"
             ts = datetime.fromtimestamp(w.get("requestedAt", 0) / 1000).strftime('%d/%m %H:%M')
             lines.append(
@@ -1195,7 +1105,6 @@ async def menu_handler(message: types.Message, state: FSMContext):
     elif txt == "🚨 রিপোর্ট করুন":
         last_report = user.get("lastReport", 0)
         if (time.time() * 1000) - last_report < 86_400_000:
-            # কখন পাঠাতে পারবে হিসাব করে দেখাও
             remaining_ms  = 86_400_000 - ((time.time() * 1000) - last_report)
             remaining_hrs = int(remaining_ms / 3_600_000)
             remaining_min = int((remaining_ms % 3_600_000) / 60_000)
@@ -1269,12 +1178,14 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
         await message.answer(f"❌ পর্যাপ্ত ব্যালেন্স নেই। আপনার ব্যালেন্স: ৳{bal}")
         return
 
-    # ── আগে থেকে pending উইথড্র আছে কিনা চেক করো ──
-    # একই সময়ে একাধিক রিকোয়েস্ট পাঠানো আটকাতে
+    # ✅ pending চেক — শুধু এই ইউজারের pending withdrawal
     try:
-        existing_withs = fdb.reference("withdrawals").order_by_child("uid").equal_to(uid).get() or {}
-        has_pending = any(w.get("status") == "pending" for w in existing_withs.values())
-        if has_pending:
+        pending_docs = db.collection("withdrawals")\
+            .where("uid", "==", uid)\
+            .where("status", "==", "pending")\
+            .limit(1)\
+            .get()
+        if pending_docs:
             await message.answer(
                 "⚠️ <b>আপনার একটি উইথড্র রিকোয়েস্ট ইতোমধ্যে প্রসেসিংয়ে আছে।</b>\n\n"
                 "আগের রিকোয়েস্ট সম্পন্ন হলে নতুন রিকোয়েস্ট করুন।",
@@ -1285,14 +1196,12 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
     except Exception as e:
         log.warning(f"Pending withdraw check error uid={uid}: {e}")
 
-    # ── সাথে সাথে balance কেটে নাও (নিরাপদ) ──
-    # এতে একই balance দিয়ে বারবার request পাঠানো যাবে না
-    deducted = fb_txn_add(uid, balance_delta=-amount)
+    deducted = fs_txn_add(uid, balance_delta=-amount)
     if not deducted:
         await message.answer("❌ ব্যালেন্স আপডেটে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
         return
 
-    wid = fb_push("withdrawals", {
+    wid = fs_add("withdrawals", {
         "uid":         uid,
         "name":        user.get("name", "?"),
         "phone":       user.get("phone", "?"),
@@ -1341,21 +1250,17 @@ async def cb_mark_paid(call: types.CallbackQuery):
     await call.answer("⏳ প্রসেস হচ্ছে...")
 
     wid = call.data.replace("paid_", "")
-    w   = fb_get(f"withdrawals/{wid}")
+    w   = fs_get("withdrawals", wid)
     if not w:
         await call.message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি!")
         return
-
-    # Double payment আটকাও
     if w.get("status") in ("paid", "success"):
         await call.message.answer("⚠️ এটা আগেই পেমেন্ট হয়ে গেছে!")
         return
 
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
-
-    fb_update(f"withdrawals/{wid}", {"status": "paid", "paidAt": int(time.time() * 1000)})
-
+    fs_update("withdrawals", wid, {"status": "paid", "paidAt": int(time.time() * 1000)})
     await _notify_user_paid(uid, w)
 
     old_text = call.message.text or ""
@@ -1363,10 +1268,7 @@ async def cb_mark_paid(call: types.CallbackQuery):
     try:
         await call.message.edit_text(new_text, reply_markup=None)
     except Exception:
-        await call.message.answer(
-            f"✅ <b>পেমেন্ট মার্ক হয়েছে!</b>\n"
-            f"WID: <code>{wid}</code> | ৳{amount}"
-        )
+        await call.message.answer(f"✅ <b>পেমেন্ট মার্ক হয়েছে!</b>\nWID: <code>{wid}</code> | ৳{amount}")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("wreject_"))
@@ -1378,21 +1280,21 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
     await call.answer("⏳ প্রসেস হচ্ছে...")
 
     wid = call.data.replace("wreject_", "")
-    w   = fb_get(f"withdrawals/{wid}")
+    w   = fs_get("withdrawals", wid)
     if not w:
         await call.message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি!")
         return
-
-     if w.get("status") != "pending":
-        await call.message.edit_text(f"⚠️ এই রিকোয়েস্টটি ইতিমধ্যে {w.get('status')} করা হয়েছে।")
-        await call.answer("ইতিমধ্যে প্রসেস করা হয়েছে!", show_alert=True)
+    if w.get("status") in ("paid", "success"):
+        await call.message.answer("⚠️ এই উইথড্র আগেই পেমেন্ট হয়ে গেছে!")
+        return
+    if w.get("status") == "rejected":
+        await call.message.answer("⚠️ এটা আগেই রিজেক্ট হয়েছে!")
         return
 
-    fb_update(f"withdrawals/{wid}", {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
+    fs_update("withdrawals", wid, {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
-    fb_txn_add(uid, balance_delta=+amount)
-
+    fs_txn_add(uid, balance_delta=+amount)
     await _notify_user_rejected(uid, w)
 
     old_text = call.message.text or ""
@@ -1400,19 +1302,12 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
     try:
         await call.message.edit_text(new_text, reply_markup=None)
     except Exception:
-        await call.message.answer(
-            f"❌ <b>রিজেক্ট হয়েছে!</b>\n"
-            f"WID: <code>{wid}</code> | ৳{amount} রিফান্ড হয়েছে।"
-        )
+        await call.message.answer(f"❌ <b>রিজেক্ট হয়েছে!</b>\nWID: <code>{wid}</code> | ৳{amount} রিফান্ড হয়েছে।")
 
 # ═══════════════════════════════════════════════════════
-#   REPORT FLOW
-# ═══════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════
-#   WITHDRAWAL NOTIFICATION HELPERS
+#   NOTIFICATION HELPERS
 # ═══════════════════════════════════════════════════════
 async def _notify_user_paid(uid: str, w: dict):
-    """ইউজারকে পেমেন্ট সম্পন্নের message পাঠাও।"""
     try:
         await bot.send_message(
             int(uid),
@@ -1421,12 +1316,10 @@ async def _notify_user_paid(uid: str, w: dict):
             f"{w.get('method','?').upper()} নম্বরে পাঠানো হয়েছে।\n"
             f"📱 নম্বর: {w.get('number','?')}"
         )
-        log.info(f"Paid notification sent to {uid}")
     except Exception as e:
         log.warning(f"Paid notify error uid={uid}: {e}")
 
 async def _notify_user_rejected(uid: str, w: dict):
-    """ইউজারকে withdrawal reject message পাঠাও।"""
     try:
         await bot.send_message(
             int(uid),
@@ -1439,70 +1332,60 @@ async def _notify_user_rejected(uid: str, w: dict):
 
 async def watch_admin_paid_notifications():
     """
-    Admin Panel থেকে 'Mark as Paid' করলে
-    withdrawal-এ adminPaidNotify field লেখা হয়।
-    এই watcher সেটা দেখে ইউজারকে Telegram message পাঠায়।
-
-    প্রতি ৮ সেকেন্ডে একবার চেক করে — দিনে ~১০,৮০০ read।
-    শুধু pending→success হওয়া records দেখে।
+    Admin Panel থেকে paid করলে ইউজারকে notify করে।
+    প্রতি ৮ সেকেন্ডে চেক করে।
+    ✅ শুধু adminPaidNotify আছে এমন docs আনে — পুরো collection নয়।
     """
-    notified_wids: set = set()              # একই wid দুইবার notify না করতে
+    notified_wids: set = set()
     while True:
         try:
-            withdrawals = fb_get("withdrawals") or {}
-            for wid, w in withdrawals.items():
+            docs = db.collection("withdrawals")\
+                .where("adminPaidNotify", "!=", None)\
+                .limit(20)\
+                .get()
+            for doc in docs:
+                wid = doc.id
                 if wid in notified_wids:
                     continue
-                # adminPaidNotify আছে মানে Admin Panel থেকে approve হয়েছে
+                w = doc.to_dict()
                 notify_uid = w.get("adminPaidNotify")
                 if notify_uid and w.get("status") in ("paid", "success"):
                     await _notify_user_paid(notify_uid, w)
-                    # field মুছে দাও — আর process না হোক
-                    fb_update(f"withdrawals/{wid}", {"adminPaidNotify": None})
+                    fs_update("withdrawals", wid, {"adminPaidNotify": firestore.DELETE_FIELD})
                     notified_wids.add(wid)
-                    log.info(f"Admin panel paid notify sent: wid={wid} uid={notify_uid}")
         except Exception as e:
             log.debug(f"watch_admin_paid_notifications error: {e}")
         await asyncio.sleep(8)
-async def _auto_delete_report(rid: str):
-    """
-    Telegram-এ পাঠানোর ৫ সেকেন্ড পর
-    Firebase-এর reports নোড থেকে মুছে দেয়।
-    Admin Panel-এ ৫ সেকেন্ডের জন্য দেখা যাবে,
-    তারপর চলে যাবে।
-    """
-    await asyncio.sleep(5)
-    fb_delete(f"reports/{rid}")
-    log.debug(f"Auto-deleted report: {rid}")
 
+async def _auto_delete_report(rid: str):
+    await asyncio.sleep(5)
+    fs_delete("reports", rid)
+
+# ═══════════════════════════════════════════════════════
+#   REPORT FLOW
+# ═══════════════════════════════════════════════════════
 @dp.message_handler(state=Report.message)
 async def report_message(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
     user = get_user(uid) or {}
 
-    # ── ২৫০ অক্ষর সীমা ──
     raw_text = message.text or ""
     if len(raw_text) > 250:
         await message.answer(
             f"❌ রিপোর্ট সর্বোচ্চ ২৫০ অক্ষর হতে পারবে।\n"
-            f"আপনি লিখেছেন {len(raw_text)} অক্ষর।\n\n"
-            f"সংক্ষেপ করে আবার লিখুন:"
+            f"আপনি লিখেছেন {len(raw_text)} অক্ষর।\n\nসংক্ষেপ করে আবার লিখুন:"
         )
-        return   # state এ থেকে যাবে — ইউজার আবার লিখতে পারবে
+        return
 
-    # ── ২৪ ঘণ্টা চেক (double check) ──
     last_report = user.get("lastReport", 0)
     if (time.time() * 1000) - last_report < 86_400_000:
         await state.finish()
-        await message.answer("⚠️ ২৪ ঘণ্টায় মাত্র একটি রিপোর্ট করা যাবে।",
-                             reply_markup=main_kb())
+        await message.answer("⚠️ ২৪ ঘণ্টায় মাত্র একটি রিপোর্ট করা যাবে।", reply_markup=main_kb())
         return
 
-    # ── lastReport আগেই সেট করো — spam block ──
     update_user(uid, {"lastReport": int(time.time() * 1000)})
     await state.finish()
 
-    # ── Admin-কে Telegram নোটিফিকেশন ──
     report_text = (
         f"🚨 <b>নতুন রিপোর্ট</b>\n"
         f"👤 {user.get('name','?')} | 📞 {user.get('phone','?')}\n"
@@ -1514,16 +1397,9 @@ async def report_message(message: types.Message, state: FSMContext):
     except Exception as e:
         log.warning(f"Report notify error: {e}")
 
-    await message.answer(
-        "✅ <b>রিপোর্ট পাঠানো হয়েছে।</b>\n\nঅ্যাডমিন শীঘ্রই ব্যবস্থা নেবেন।",
-        reply_markup=main_kb()
-    )
+    await message.answer("✅ <b>রিপোর্ট পাঠানো হয়েছে।</b>\n\nঅ্যাডমিন শীঘ্রই ব্যবস্থা নেবেন।", reply_markup=main_kb())
 
-    # ── ৫ সেকেন্ড পর DB থেকে auto-delete ──
-    # (reports নোড-এ সেভ হয় না — শুধু Telegram-এ পাঠানো হয়)
-    # কিন্তু যদি Admin Panel-এর জন্য সেভ করতেই চান,
-    # তাহলে নিচের কোড ব্যবহার করুন — ৫ সেকেন্ড পর মুছে যাবে:
-    rid = fb_push("reports", {
+    rid = fs_add("reports", {
         "uid":       uid,
         "name":      user.get("name", "?"),
         "phone":     user.get("phone", "?"),
@@ -1531,7 +1407,6 @@ async def report_message(message: types.Message, state: FSMContext):
         "createdAt": int(time.time() * 1000),
     })
     if rid:
-        # asyncio task — ৫ সেকেন্ড অপেক্ষা করে তারপর মুছে দেয়
         asyncio.get_event_loop().create_task(_auto_delete_report(rid))
 
 # ═══════════════════════════════════════════════════════
@@ -1549,24 +1424,31 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
     # ── ড্যাশবোর্ড ──
     if "📊 ড্যাশবোর্ড" in txt:
-        # total & active — shallow read + stored counter (পুরো users লোড করে না)
         try:
-            users_snap = fdb.reference("users").get(shallow=True)
-            total    = len(users_snap) if users_snap else 0
-            active_u = fb_get("stats/active_users") or "?"
+            # ✅ shallow — শুধু count আনো, পুরো data নয়
+            users_count_doc = db.collection("stats").document("main").get()
+            stats = users_count_doc.to_dict() if users_count_doc.exists else {}
+            total    = stats.get("total_users", "?")
+            active_u = stats.get("active_users", "?")
         except Exception:
             total, active_u = "?", "?"
 
-        vers   = fb_get("verifications") or {}
-        withs  = fb_get("withdrawals")   or {}
-        s      = get_settings()
+        # ✅ শুধু pending docs আনো
+        try:
+            ver_pend = len(db.collection("verifications").where("status", "==", "pending").select([]).get())
+        except Exception:
+            ver_pend = "?"
+        try:
+            wit_pend = len(db.collection("withdrawals").where("status", "==", "pending").select([]).get())
+        except Exception:
+            wit_pend = "?"
 
-        ver_pend = sum(1 for v in vers.values() if v.get("status") in ("pending","review"))
-        wit_pend = sum(1 for w in withs.values() if w.get("status") == "pending")
-
-        # Revenue — stored value (approve করার সময় সেভ হয়)
         today_key = date.today().strftime("%Y-%m-%d")
-        rev       = fb_get(f"dailyRevenue/{today_key}") or 0
+        try:
+            rev_doc = db.collection("dailyRevenue").document(today_key).get()
+            rev = rev_doc.to_dict().get("amount", 0) if rev_doc.exists else 0
+        except Exception:
+            rev = 0
 
         await message.answer(
             f"📊 <b>লাইভ ড্যাশবোর্ড</b>\n"
@@ -1582,15 +1464,24 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
     # ── পেন্ডিং ভেরিফিকেশন ──
     elif "⏳ পেন্ডিং ভেরিফিকেশন" in txt:
-        vers  = fb_get("verifications") or {}
-        plist = [(vid, v) for vid, v in vers.items() if v.get("status") in ("pending", "review")]
+        try:
+            docs = db.collection("verifications")\
+                .where("status", "==", "pending")\
+                .order_by("submittedAt")\
+                .limit(10)\
+                .get()
+        except Exception as e:
+            await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
+            return
 
-        if not plist:
+        if not docs:
             await message.answer("✅ কোনো পেন্ডিং ভেরিফিকেশন নেই!")
             return
 
-        await message.answer(f"⏳ <b>পেন্ডিং ভেরিফিকেশন ({len(plist)} টি)</b>")
-        for vid, v in plist[:10]:
+        await message.answer(f"⏳ <b>পেন্ডিং ভেরিফিকেশন ({len(docs)} টি)</b>")
+        for doc in docs:
+            vid = doc.id
+            v   = doc.to_dict()
             uid = v.get("uid", "?")
             kb  = approve_reject_kb(f"{uid}|{vid}", "ver")
             await message.answer(
@@ -1603,15 +1494,24 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
     # ── পেন্ডিং উইথড্রয়াল ──
     elif "💸 পেন্ডিং উইথড্রয়াল" in txt:
-        withs  = fb_get("withdrawals") or {}
-        plist  = [(wid, w) for wid, w in withs.items() if w.get("status") == "pending"]
+        try:
+            docs = db.collection("withdrawals")\
+                .where("status", "==", "pending")\
+                .order_by("requestedAt")\
+                .limit(10)\
+                .get()
+        except Exception as e:
+            await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
+            return
 
-        if not plist:
+        if not docs:
             await message.answer("✅ কোনো পেন্ডিং উইথড্রয়াল নেই!")
             return
 
-        await message.answer(f"💸 <b>পেন্ডিং উইথড্রয়াল ({len(plist)} টি)</b>")
-        for wid, w in plist[:10]:
+        await message.answer(f"💸 <b>পেন্ডিং উইথড্রয়াল ({len(docs)} টি)</b>")
+        for doc in docs:
+            wid = doc.id
+            w   = doc.to_dict()
             await message.answer(
                 f"👤 {w.get('name','?')} | 📞 {w.get('phone','?')}\n"
                 f"📱 <code>{w.get('number','?')}</code>\n"
@@ -1649,25 +1549,32 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
     # ── মেইন মেনু ──
     elif "🏠 মেইন মেনু" in txt:
-        user = get_user(str(message.from_user.id)) or {}
+        uid  = str(message.from_user.id)
+        user = get_user(uid) or {}
         s    = get_settings()
-        await _show_home(message, str(message.from_user.id), user, s)
+        await _show_home(message, uid, user, s)
 
-    # ── উইথড্র হিস্ট্রি ──
+    # ── উইথড্র হিস্ট্রি — ✅ শুধু completed docs ──
     elif "📋 উইথড্র হিস্ট্রি" in txt:
-        withs = fb_get("withdrawals") or {}
-        done  = [(wid, w) for wid, w in withs.items()
-                 if w.get("status") in ("paid", "success", "rejected")]
-        done.sort(key=lambda x: x[1].get("createdAt", 0), reverse=True)
+        try:
+            docs = db.collection("withdrawals")\
+                .where("status", "in", ["paid", "success", "rejected"])\
+                .order_by("requestedAt", direction=firestore.Query.DESCENDING)\
+                .limit(15)\
+                .get()
+        except Exception as e:
+            await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
+            return
 
-        if not done:
+        if not docs:
             await message.answer("📋 কোনো সম্পন্ন উইথড্রয়াল নেই।")
             return
 
-        lines = [f"📋 <b>উইথড্র হিস্ট্রি (সর্বশেষ {min(len(done),15)} টি)</b>\n"]
-        for wid, w in done[:15]:
+        lines = [f"📋 <b>উইথড্র হিস্ট্রি (সর্বশেষ {len(docs)} টি)</b>\n"]
+        for doc in docs:
+            w      = doc.to_dict()
             icon   = "✅" if w.get("status") in ("paid", "success") else "❌"
-            ts     = w.get("createdAt", 0)
+            ts     = w.get("requestedAt", 0)
             dt_str = datetime.fromtimestamp(ts / 1000).strftime("%d/%m %H:%M") if ts else "?"
             lines.append(
                 f"{icon} {w.get('name','?')} | ৳{w.get('amount','?')} | "
@@ -1675,83 +1582,70 @@ async def admin_handler(message: types.Message, state: FSMContext):
             )
         await message.answer("\n".join(lines))
 
-    # ── একটিভ ইউজার লিস্ট ──
+    # ── একটিভ ইউজার লিস্ট — ✅ শুধু শেষ ২০ জন ──
     elif "👥 একটিভ ইউজার লিস্ট" in txt:
         await message.answer("⏳ একটিভ ইউজার লোড হচ্ছে...")
         try:
-            all_users = fdb.reference("users").order_by_child("status").equal_to("active").get() or {}
+            docs = db.collection("users")\
+                .where("status", "==", "active")\
+                .order_by("verifiedAt", direction=firestore.Query.DESCENDING)\
+                .limit(20)\
+                .get()
         except Exception as e:
             await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
             return
 
-        if not all_users:
+        if not docs:
             await message.answer("কোনো একটিভ ইউজার নেই।")
             return
 
-        user_list = sorted(
-            all_users.items(),
-            key=lambda x: x[1].get("verifiedAt", 0),
-            reverse=True
-        )
-        total = len(user_list)
-        lines = [f"✅ <b>একটিভ ইউজার ({bn(total)} জন) — সর্বশেষ ২০ জন:</b>\n"]
-        for i, (uid_key, u) in enumerate(user_list[:20], 1):
+        lines = [f"✅ <b>একটিভ ইউজার (সর্বশেষ {len(docs)} জন):</b>\n"]
+        medals = ["১","২","৩","৪","৫","৬","৭","৮","৯","১০",
+                  "১১","১২","১৩","১৪","১৫","১৬","১৭","১৮","১৯","২০"]
+        for i, doc in enumerate(docs):
+            u      = doc.to_dict()
             ts     = u.get("verifiedAt", 0)
             dt_str = datetime.fromtimestamp(ts / 1000).strftime("%d/%m/%y") if ts else "?"
             lines.append(
-                f"{bn(i)}. {u.get('name','?')} | "
+                f"{medals[i]}. {u.get('name','?')} | "
                 f"📞 {u.get('phone','?')} | "
                 f"💰 ৳{u.get('balance', 0)} | {dt_str}"
             )
         await message.answer("\n".join(lines))
 
-    # ── টপ রেফারার ──
+    # ── টপ রেফারার — ✅ referStats থেকে আনো, পুরো users নয় ──
     elif "🏆 টপ রেফারার" in txt:
         await message.answer("⏳ টপ রেফারার লোড হচ্ছে...")
         try:
-            all_users = fdb.reference("users").order_by_child("status").equal_to("active").get() or {}
+            docs = db.collection("referStats")\
+                .order_by("count", direction=firestore.Query.DESCENDING)\
+                .limit(10)\
+                .get()
         except Exception as e:
             await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
             return
 
-        # প্রতিটি ইউজারের referredBy গণনা করো
-        ref_count: dict = {}
-        ref_info:  dict = {}
-        for uid_key, u in all_users.items():
-            ref_uid = u.get("referredBy")
-            if ref_uid:
-                ref_count[ref_uid] = ref_count.get(ref_uid, 0) + 1
-
-        # নাম ও ফোন সংগ্রহ
-        for uid_key, u in all_users.items():
-            if uid_key in ref_count:
-                ref_info[uid_key] = {
-                    "name":    u.get("name", "?"),
-                    "phone":   u.get("phone", "?"),
-                    "balance": u.get("balance", 0),
-                    "points":  u.get("points", 0),
-                }
-
-        if not ref_count:
+        if not docs:
             await message.answer("🏆 এখনো কোনো রেফার হয়নি।")
             return
 
-        top = sorted(ref_count.items(), key=lambda x: x[1], reverse=True)[:10]
         lines = ["🏆 <b>টপ রেফারার (শীর্ষ ১০)</b>\n"]
         medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-        for i, (uid_key, count) in enumerate(top):
-            info = ref_info.get(uid_key, {})
+        for i, doc in enumerate(docs):
+            uid_key = doc.id
+            count   = doc.to_dict().get("count", 0)
+            # cache থেকে আসবে বেশিরভাগ সময় — মাত্র ১০টা read
+            u = get_user(uid_key) or {}
             lines.append(
-                f"{medals[i]} {info.get('name','?')} | "
-                f"📞 {info.get('phone','?')}\n"
+                f"{medals[i]} {u.get('name','?')} | "
+                f"📞 {u.get('phone','?')}\n"
                 f"   👥 রেফার: {bn(count)} জন | "
-                f"💰 ৳{info.get('balance',0)} | "
-                f"🎯 {bn(info.get('points',0))} পয়েন্ট\n"
+                f"💰 ৳{u.get('balance',0)} | "
+                f"🎯 {bn(u.get('points',0))} পয়েন্ট\n"
             )
         await message.answer("\n".join(lines))
 
     else:
-        # fallback — treat admin as user if not a command
         pass
 
 
@@ -1760,20 +1654,20 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
     notice_text = message.text
     await state.finish()
 
-    # শুধু UID keys আনো — পুরো profile data নয় (memory safe)
+    # ✅ শুধু UID আনো — পুরো profile নয়
     try:
-        users_snap = fdb.reference("users").get(shallow=True) or {}
+        # Firestore-এ document ID = UID, তাই select([]) দিয়ে শুধু IDs আনা যায়
+        docs = db.collection("users").select([]).get()
+        uid_list = [doc.id for doc in docs]
     except Exception as e:
         await message.answer(f"❌ ইউজার তালিকা আনতে সমস্যা: {e}", reply_markup=admin_kb())
         return
 
-    uid_list   = list(users_snap.keys())
     total_users = len(uid_list)
     await message.answer(f"⏳ {bn(total_users)} জনের কাছে পাঠানো শুরু হচ্ছে...")
 
     sent = 0
     failed = 0
-    # ৫০ জন করে batch — Render free tier-এ memory safe
     BATCH = 50
     for i in range(0, total_users, BATCH):
         batch = uid_list[i:i + BATCH]
@@ -1786,13 +1680,9 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
                 sent += 1
             except Exception:
                 failed += 1
-            await asyncio.sleep(0.034)   # ~30 msg/sec — Telegram safe limit
-        # প্রতি ৫০০ জনের পর progress জানান
+            await asyncio.sleep(0.034)
         if (i + BATCH) % 500 == 0 and i + BATCH < total_users:
-            await message.answer(
-                f"⏳ অগ্রগতি: {bn(i + BATCH)}/{bn(total_users)} জন সম্পন্ন..."
-            )
-        # প্রতি batch-এর পর ২ সেকেন্ড বিরতি
+            await message.answer(f"⏳ অগ্রগতি: {bn(i + BATCH)}/{bn(total_users)} জন সম্পন্ন...")
         if i + BATCH < total_users:
             await asyncio.sleep(2)
 
@@ -1813,7 +1703,7 @@ async def cmd_status(message: types.Message, state: FSMContext):
     if not user:
         await message.answer("আপনার কোনো অ্যাকাউন্ট নেই। /start দিন।")
         return
-    st   = user.get("status", "?")
+    st    = user.get("status", "?")
     icons = {"active":"✅","pending":"⏳","review":"🔍","rejected":"❌","banned":"🚫","new":"🆕"}
     await message.answer(
         f"📍 <b>একাউন্ট স্ট্যাটাস</b>\n\n"
@@ -1858,40 +1748,35 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 @dp.message_handler(state="*")
 async def fallback(message: types.Message, state: FSMContext):
     uid  = str(message.from_user.id)
-    user = get_user(uid)   # cache চেক করে, miss হলে Firebase থেকে আনে
-    if user:
-        cache_set_user(uid, user)
+    user = get_user(uid)
     if not user or user.get("status") != "active":
         await cmd_start(message, state)
         return
-    await message.answer(
-        "ℹ️ নিচের মেনু থেকে অপশন বেছে নিন।",
-        reply_markup=main_kb()
-    )
+    await message.answer("ℹ️ নিচের মেনু থেকে অপশন বেছে নিন।", reply_markup=main_kb())
 
 # ═══════════════════════════════════════════════════════
-#   MAIN
+#   CACHE CLEANUP
 # ═══════════════════════════════════════════════════════
-
 async def cleanup_old_cache():
-    """প্রতি ঘণ্টায় মেয়াদ শেষ cache entries মুছে RAM মুক্ত রাখে"""
+    """প্রতি ঘণ্টায় মেয়াদ শেষ cache entries মুছে RAM মুক্ত রাখে।"""
     while True:
-        await asyncio.sleep(3600)  # ১ ঘণ্টা
+        await asyncio.sleep(3600)
         now = time.time()
         expired = [uid for uid, entry in list(_user_cache.items())
                    if (now - entry["ts"]) > USER_CACHE_TTL]
         for uid in expired:
             _user_cache.pop(uid, None)
         if expired:
-            log.info(f"🧹 Cache cleanup: {len(expired)} expired entries removed. "
-                     f"Remaining: {len(_user_cache)}")
+            log.info(f"🧹 Cache cleanup: {len(expired)} expired entries removed. Remaining: {len(_user_cache)}")
 
+# ═══════════════════════════════════════════════════════
+#   MAIN
+# ═══════════════════════════════════════════════════════
 if __name__ == '__main__':
-    keep_alive()   # Flask port 8080 — Render health check
-    log.info("IncomeApp Bot starting (polling mode)...")
-    log.info("💡 Tip: cron-job.org দিয়ে /health URL প্রতি ১৪ মিনিটে ping করুন।")
+    keep_alive()
+    log.info("IncomeApp Bot starting (Firestore mode)...")
 
     loop = asyncio.get_event_loop()
     loop.create_task(watch_admin_paid_notifications())
-    loop.create_task(cleanup_old_cache())   # ← hourly cache cleanup
+    loop.create_task(cleanup_old_cache())
     executor.start_polling(dp, skip_updates=True, loop=loop)
