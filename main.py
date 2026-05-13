@@ -226,9 +226,11 @@ def cache_set_user(uid: str, data: dict):
         return
     if len(_user_cache) >= MAX_CACHE_SIZE:
         remove_count = MAX_CACHE_SIZE // 10
-        for key in list(_user_cache.keys())[:remove_count]:
+        # ✅ সবচেয়ে পুরনো entries আগে বের করো (timestamp অনুযায়ী)
+        oldest_keys = sorted(_user_cache, key=lambda k: _user_cache[k]["ts"])[:remove_count]
+        for key in oldest_keys:
             del _user_cache[key]
-        log.debug(f"Cache evicted {remove_count} entries")
+        log.debug(f"Cache evicted {remove_count} oldest entries")
     _user_cache[uid] = {"data": dict(data), "ts": time.time()}
 
 def cache_invalidate_user(uid: str):
@@ -336,9 +338,16 @@ def make_unique_refer_code(name: str) -> str:
 #   BENGALI NUMBER CONVERTER
 # ═══════════════════════════════════════════════════════
 def bn(n) -> str:
+    """সংখ্যাকে বাংলা অঙ্কে রূপান্তর। দশমিক থাকলে দুই ঘর দেখাবে।"""
     try:
-        s = str(int(float(n)))
-        d = {'0':'০','1':'১','2':'২','3':'৩','4':'৪','5':'৫','6':'৬','7':'৭','8':'৮','9':'৯'}
+        f = float(n)
+        # দশমিক অংশ অর্থপূর্ণ হলে দেখাও, না হলে integer
+        if f != int(f):
+            s = f"{f:.2f}"
+        else:
+            s = str(int(f))
+        d = {'0':'০','1':'১','2':'২','3':'৩','4':'৪',
+             '5':'৫','6':'৬','7':'৭','8':'৮','9':'৯','.':'.','-':'-'}
         return ''.join(d.get(c, c) for c in s)
     except:
         return "০"
@@ -686,22 +695,56 @@ async def pay_sender_phone(message: types.Message, state: FSMContext):
         await message.answer("❌ সঠিক অপারেটর কোড দিন (011-019)।")
         return
     await state.update_data(sender_phone=phone)
+    data   = await state.get_data()
+    method = data.get("method", "bkash")
     await Pay.txn_id.set()
     await message.answer(
         f"✅ নম্বর সেভ হয়েছে: <code>{phone}</code>\n\n"
-        f"🆔 এখন আপনার <b>ট্রান্জেকশন আইডি (TxnID)</b> দিন:"
+        f"🆔 এখন আপনার <b>ট্রান্জেকশন আইডি (TxnID)</b> দিন:\n\n"
+        f"{'📱 বিকাশ TxnID: ঠিক ১০ অক্ষর।' if method=='bkash' else '💚 নগদ TxnID: ঠিক ৮ অক্ষর।'}\n"
+        f"{'উদাহরণ: <code>DDO8HH4U5K</code>' if method=='bkash' else 'উদাহরণ: <code>AB12CD34</code>'}\n"
+        f"(ছোট হাতে লিখলেও স্বয়ংক্রিয়ভাবে বড় হাতে হয়ে যাবে)"
     )
 
 def _validate_txn(txn: str, method: str) -> tuple[bool, str]:
+    """
+    বিকাশ: ঠিক ১০ অক্ষর, শুধু বড় হাতের অক্ষর (A-Z) ও সংখ্যা (0-9)।
+            উদাহরণ: DDO8HH4U5K
+    নগদ:   ঠিক ৮ অক্ষর, একই ফরম্যাট।
+    """
     expected = 10 if method == "bkash" else 8
-    txn_up   = txn.upper()
+    txn_up   = txn.strip().upper()
+
+    if not txn_up:
+        return False, (
+            f"❌ ট্রান্জেকশন আইডি খালি রাখা যাবে না।\n"
+            f"{'বিকাশ' if method=='bkash' else 'নগদ'} TxnID ঠিক {expected} অক্ষরের হয়।\n"
+            f"উদাহরণ: {'DDO8HH4U5K' if method=='bkash' else 'AB12CD34'}"
+        )
+
+    if len(txn_up) != expected:
+        return False, (
+            f"❌ {'বিকাশ' if method=='bkash' else 'নগদ'} TxnID ঠিক <b>{expected} অক্ষরের</b> হয়।\n"
+            f"আপনি দিয়েছেন: {len(txn_up)} অক্ষর।\n"
+            f"উদাহরণ: {'DDO8HH4U5K' if method=='bkash' else 'AB12CD34'}"
+        )
+
+    # শুধু A-Z এবং 0-9 অনুমোদিত
+    if not all(c.isupper() or c.isdigit() for c in txn_up):
+        return False, (
+            f"❌ TxnID-তে শুধু বড় হাতের অক্ষর (A-Z) ও সংখ্যা (0-9) থাকবে।\n"
+            f"বিশেষ চিহ্ন বা ছোট হাতের অক্ষর গ্রহণযোগ্য নয়।\n"
+            f"উদাহরণ: {'DDO8HH4U5K' if method=='bkash' else 'AB12CD34'}"
+        )
+
     has_letter = any(c.isalpha() for c in txn_up)
     has_digit  = any(c.isdigit() for c in txn_up)
-    is_alnum   = all(c.isalnum() for c in txn_up)
-    if not txn or len(txn_up) != expected:
-        return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
-    if not is_alnum or not has_letter or not has_digit:
-        return False, "❌ ট্রান্জেকশন আইডি সঠিক নয়। আবার চেষ্টা করুন:"
+    if not has_letter or not has_digit:
+        return False, (
+            f"❌ TxnID-তে অন্তত একটি অক্ষর ও একটি সংখ্যা থাকতে হবে।\n"
+            f"উদাহরণ: {'DDO8HH4U5K' if method=='bkash' else 'AB12CD34'}"
+        )
+
     return True, ""
 
 @dp.message_handler(state=Pay.txn_id)
@@ -794,7 +837,11 @@ async def cb_approve_ver(call: types.CallbackQuery):
     # stats counter — Firestore Increment (race-safe)
     try:
         db.collection("stats").document("main").set(
-            {"active_users": firestore.Increment(1)}, merge=True
+            {
+                "active_users": firestore.Increment(1),
+                "total_users":  firestore.Increment(1),
+            },
+            merge=True
         )
     except Exception:
         pass
@@ -1016,15 +1063,45 @@ async def menu_handler(message: types.Message, state: FSMContext):
                 f"☀️ <b>ডেইলি বোনাস</b>\n\nআজকের বোনাস ইতোমধ্যে নেওয়া হয়েছে।\nকাল আবার আসুন! ⏰"
             )
         else:
-            fs_txn_add(uid, points_delta=bonus)
-            update_user(uid, {"lastDailyBonus": int(time.time() * 1000)})
-            new_pts = user.get("points", 0) + bonus
-            await message.answer(
-                f"🎁 <b>ডেইলি বোনাস পেয়েছেন!</b>\n\n"
-                f"✅ +{bonus} পয়েন্ট আপনার একাউন্টে যোগ হয়েছে।\n"
-                f"🎯 এখন আপনার পয়েন্ট: <b>{bn(new_pts)}</b>\n\n"
-                f"কাল আবার এসে বোনাস নিন! 😊"
-            )
+            # ✅ Race-condition safe: একটি transaction-এ points ও lastDailyBonus একসাথে আপডেট
+            today_claim_ts = int(time.time() * 1000)
+            try:
+                user_ref = db.collection("users").document(uid)
+
+                @firestore.transactional
+                def _claim_daily(transaction, ref):
+                    snap = ref.get(transaction=transaction)
+                    if not snap.exists:
+                        return False, 0
+                    d = snap.to_dict()
+                    # double-claim চেক transaction-এর ভেতরেও
+                    if d.get("lastDailyBonus", 0) >= today_ts:
+                        return False, 0
+                    new_pts = max(0, d.get("points", 0) + bonus)
+                    transaction.update(ref, {
+                        "points":         new_pts,
+                        "lastDailyBonus": today_claim_ts,
+                    })
+                    return True, new_pts
+
+                txn = db.transaction()
+                claimed, new_pts = _claim_daily(txn, user_ref)
+                cache_invalidate_user(uid)
+            except Exception as e:
+                log.error(f"Daily bonus txn error uid={uid}: {e}")
+                claimed, new_pts = False, 0
+
+            if not claimed:
+                await message.answer(
+                    f"☀️ <b>ডেইলি বোনাস</b>\n\nআজকের বোনাস ইতোমধ্যে নেওয়া হয়েছে।\nকাল আবার আসুন! ⏰"
+                )
+            else:
+                await message.answer(
+                    f"🎁 <b>ডেইলি বোনাস পেয়েছেন!</b>\n\n"
+                    f"✅ +{bonus} পয়েন্ট আপনার একাউন্টে যোগ হয়েছে।\n"
+                    f"🎯 এখন আপনার পয়েন্ট: <b>{bn(new_pts)}</b>\n\n"
+                    f"কাল আবার এসে বোনাস নিন! 😊"
+                )
 
     # ── উত্তোলন ──
     elif txt == "💸 টাকা উত্তোলন":
@@ -1178,26 +1255,38 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
         await message.answer(f"❌ পর্যাপ্ত ব্যালেন্স নেই। আপনার ব্যালেন্স: ৳{bal}")
         return
 
-    # ✅ pending চেক — শুধু এই ইউজারের pending withdrawal
+    # ✅ Atomic: pending চেক + balance deduct একই transaction-এ — double-spend অসম্ভব
     try:
-        pending_docs = db.collection("withdrawals")\
-            .where("uid", "==", uid)\
-            .where("status", "==", "pending")\
-            .limit(1)\
-            .get()
-        if pending_docs:
-            await message.answer(
-                "⚠️ <b>আপনার একটি উইথড্র রিকোয়েস্ট ইতোমধ্যে প্রসেসিংয়ে আছে।</b>\n\n"
-                "আগের রিকোয়েস্ট সম্পন্ন হলে নতুন রিকোয়েস্ট করুন।",
-                reply_markup=main_kb()
-            )
-            await state.finish()
-            return
-    except Exception as e:
-        log.warning(f"Pending withdraw check error uid={uid}: {e}")
+        user_ref = db.collection("users").document(uid)
 
-    deducted = fs_txn_add(uid, balance_delta=-amount)
-    if not deducted:
+        @firestore.transactional
+        def _atomic_withdraw(transaction, ref):
+            snap = ref.get(transaction=transaction)
+            if not snap.exists:
+                return "no_user"
+            d = snap.to_dict()
+            current_bal = d.get("balance", 0)
+            if current_bal < amount:
+                return "insufficient"
+            transaction.update(ref, {"balance": round(current_bal - amount, 2)})
+            return "ok"
+
+        txn    = db.transaction()
+        result = _atomic_withdraw(txn, user_ref)
+        cache_invalidate_user(uid)
+    except Exception as e:
+        log.error(f"Withdraw atomic txn error uid={uid}: {e}")
+        result = "error"
+
+    if result == "no_user":
+        await message.answer("❌ অ্যাকাউন্ট পাওয়া যায়নি।", reply_markup=main_kb())
+        await state.finish()
+        return
+    if result == "insufficient":
+        await message.answer(f"❌ পর্যাপ্ত ব্যালেন্স নেই।", reply_markup=main_kb())
+        await state.finish()
+        return
+    if result == "error":
         await message.answer("❌ ব্যালেন্স আপডেটে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
         return
 
