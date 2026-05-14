@@ -701,9 +701,9 @@ async def pay_sender_phone(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ নম্বর সেভ হয়েছে: <code>{phone}</code>\n\n"
         f"🆔 এখন আপনার <b>ট্রান্জেকশন আইডি (TxnID)</b> দিন:\n\n"
-        f"{'📱 বিকাশ TxnID: ঠিক ১০ অক্ষর।' if method=='bkash' else '💚 নগদ TxnID: ঠিক ৮ অক্ষর।'}\n"
+        f"{'📱 বিকাশ/নগদ TxnID: ঠিক ১০/৮ অক্ষর।' if method=='bkash' else '💚 নগদ TxnID: ঠিক ৮ অক্ষর।📳'}\n"
         f"{'উদাহরণ: <code>DDO8HH4U5K</code>' if method=='bkash' else 'উদাহরণ: <code>AB12CD34</code>'}\n"
-        f"(ছোট হাতে লিখলেও স্বয়ংক্রিয়ভাবে বড় হাতে হয়ে যাবে)"
+        f"(একই TxnID ব্যবহার করবেন না।✖️ সঠিক TxnID দিন,তা না হলে রিজেক্ট❌ করে দেওয়া হবে। ৩ বার ভুল দিলে একাউন্ট ব্যান ❎)"
     )
 
 def _validate_txn(txn: str, method: str) -> tuple[bool, str]:
@@ -1170,7 +1170,7 @@ async def menu_handler(message: types.Message, state: FSMContext):
             f"• রেফার আয়: ৳{s['earn3']}\n"
             f"• সর্বনিম্ন উত্তোলন: ৳১০০\n\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"☀️ ডেইলি বোনাস: +{s['dailyBonus']} পয়েন্ট\n\n"
+            f"☀️ ডেইলি বোনাস: +{s['dailyBonus']} পয়েন্ট❇️ আর প্রতি রেফারে পাবেন ১০০ পয়েন্ট 💠\n\n"
             f"⚠️ <b>গুরুত্বপূর্ণ নিয়ম:</b>\n"
             f"• জালিয়াতি করলে স্থায়ী ব্যান\n"
             f"• একটি আইডিতে একটি অ্যাকাউন্ট\n"
