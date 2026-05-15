@@ -24,7 +24,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, db as rtdb
 
 # ═══════════════════════════════════════════════════════
 #   KEEP-ALIVE  (Replit / Render)
@@ -65,26 +65,42 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log     = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════
-#   FIRESTORE INITIALIZATION
+#   FIREBASE INITIALIZATION
 #
-#   Render → Environment Variables-এ দিন:
-#     FIREBASE_KEYS  = { Service Account JSON-এর পুরো কন্টেন্ট }
+#   Render → Environment Variables-এ দুটো variable যোগ করুন:
 #
-#   Firebase Console → Project Settings →
-#   Service Accounts → Generate New Private Key
+#   FIREBASE_KEYS     → Service Account JSON-এর পুরো কন্টেন্ট
+#                       (Firebase Console → Project Settings →
+#                        Service Accounts → Generate New Private Key)
+#
+#   FIREBASE_DB_URL   → Realtime Database URL
+#                       (Firebase Console → Project Settings →
+#                        General → Your apps → databaseURL)
+#                       উদাহরণ:
+#                       https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app
+#
+#   ভবিষ্যতে database পরিবর্তন হলে শুধু Render থেকে
+#   FIREBASE_DB_URL আপডেট করুন — কোড ছুঁতে হবে না।
 # ═══════════════════════════════════════════════════════
 _firebase_keys_raw = os.getenv('FIREBASE_KEYS', '')
-_firebase_ok = False
-db = None  # Firestore client
+_firebase_ok       = False
+db                 = None  # Firestore client
+
+# Render → Environment Variables → FIREBASE_DB_URL
+RTDB_URL = os.environ.get('FIREBASE_DB_URL', '')
 
 if _firebase_keys_raw:
     try:
         _cred_dict = json.loads(_firebase_keys_raw)
         _cred      = credentials.Certificate(_cred_dict)
-        firebase_admin.initialize_app(_cred)
+        if RTDB_URL:
+            firebase_admin.initialize_app(_cred, {'databaseURL': RTDB_URL})
+            log.info("✅ Firestore + Realtime Database initialized")
+        else:
+            firebase_admin.initialize_app(_cred)
+            log.warning("⚠️ FIREBASE_DB_URL নেই — Realtime Database stats কাজ করবে না")
         db = firestore.client()
         _firebase_ok = True
-        log.info("✅ Firestore initialized")
     except json.JSONDecodeError as _e:
         log.error(f"❌ FIREBASE_KEYS JSON parse error: {_e}")
     except Exception as _e:
@@ -204,6 +220,155 @@ def increment_refer_stat(referrer_uid: str):
         ref.set({"count": firestore.Increment(1)}, merge=True)
     except Exception as e:
         log.error(f"increment_refer_stat error: {e}")
+
+# ═══════════════════════════════════════════════════════
+#   REALTIME DATABASE — STATS HELPERS
+#   stats/main  নোডে সব counter রাখা হয়।
+#   ১টা read-এ পুরো dashboard পাওয়া যায়।
+#   লক্ষ ইউজারেও Firebase free tier handle করতে পারে।
+#
+#   Render-এ নতুন env variable যোগ করুন:
+#     RTDB_URL = https://YOUR-PROJECT-default-rtdb.REGION.firebasedatabase.app
+# ═══════════════════════════════════════════════════════
+
+def _rtdb_ref(path: str):
+    """RTDB reference বানাও। RTDB_URL না থাকলে None।"""
+    if not RTDB_URL:
+        return None
+    try:
+        return rtdb.reference(path)
+    except Exception as e:
+        log.error(f"_rtdb_ref error [{path}]: {e}")
+        return None
+
+def rtdb_increment(path: str, delta):
+    """Realtime Database-এ atomic increment।"""
+    try:
+        ref = _rtdb_ref(path)
+        if ref is None:
+            return
+        ref.transaction(lambda current: (current or 0) + delta)
+    except Exception as e:
+        log.error(f"rtdb_increment error [{path}]: {e}")
+
+def rtdb_stats_new_verification(fee: float):
+    """
+    ভেরিফিকেশন অ্যাপ্রুভ হলে কল করো।
+    → total_verifications +1
+    → total_income += fee
+    → daily_income[আজকের তারিখ] += fee
+    """
+    try:
+        if not RTDB_URL:
+            return
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        rtdb_increment("stats/main/total_verifications", 1)
+        rtdb_increment("stats/main/total_income", fee)
+        rtdb_increment(f"stats/daily_income/{today_key}", fee)
+    except Exception as e:
+        log.error(f"rtdb_stats_new_verification error: {e}")
+
+def rtdb_stats_new_withdrawal(amount: float, uid: str, name: str):
+    """
+    উইথড্র paid হলে কল করো।
+    → total_withdrawals +1
+    → total_withdrawal_amount += amount
+    → top100_withdrawers আপডেট
+    """
+    try:
+        if not RTDB_URL:
+            return
+        rtdb_increment("stats/main/total_withdrawals", 1)
+        rtdb_increment("stats/main/total_withdrawal_amount", amount)
+        # top withdrawer entry আপডেট
+        w_ref = _rtdb_ref(f"stats/top_withdrawers/{uid}")
+        if w_ref:
+            def _update_w(current):
+                c = current or {"name": name, "total": 0}
+                c["total"] = round((c.get("total") or 0) + amount, 2)
+                c["name"]  = name
+                return c
+            w_ref.transaction(_update_w)
+    except Exception as e:
+        log.error(f"rtdb_stats_new_withdrawal error: {e}")
+
+def rtdb_stats_update_refer(uid: str, name: str, earn: float):
+    """
+    রেফার বোনাস দেওয়া হলে কল করো।
+    → total_refer_paid += earn
+    → top_referrers[uid] count +1
+    """
+    try:
+        if not RTDB_URL:
+            return
+        rtdb_increment("stats/main/total_refer_paid", earn)
+        r_ref = _rtdb_ref(f"stats/top_referrers/{uid}")
+        if r_ref:
+            def _update_r(current):
+                c = current or {"name": name, "count": 0}
+                c["count"] = (c.get("count") or 0) + 1
+                c["name"]  = name
+                return c
+            r_ref.transaction(_update_r)
+    except Exception as e:
+        log.error(f"rtdb_stats_update_refer error: {e}")
+
+def rtdb_get_dashboard() -> dict:
+    """
+    Dashboard-এর জন্য RTDB থেকে সব stats একসাথে আনো।
+    মাত্র ১টা read — লক্ষ ইউজারেও ফ্রি।
+    """
+    try:
+        if not RTDB_URL:
+            return {}
+        ref = _rtdb_ref("stats/main")
+        if ref is None:
+            return {}
+        data = ref.get()
+        return data or {}
+    except Exception as e:
+        log.error(f"rtdb_get_dashboard error: {e}")
+        return {}
+
+def rtdb_get_top_referrers(limit: int = 100) -> list:
+    """
+    RTDB থেকে টপ রেফারারদের তালিকা আনো (max limit জন)।
+    """
+    try:
+        if not RTDB_URL:
+            return []
+        ref = _rtdb_ref("stats/top_referrers")
+        if ref is None:
+            return []
+        data = ref.order_by_child("count").limit_to_last(limit).get()
+        if not data:
+            return []
+        items = [{"uid": k, **v} for k, v in data.items()]
+        items.sort(key=lambda x: x.get("count", 0), reverse=True)
+        return items
+    except Exception as e:
+        log.error(f"rtdb_get_top_referrers error: {e}")
+        return []
+
+def rtdb_get_top_withdrawers(limit: int = 100) -> list:
+    """
+    RTDB থেকে টপ উইথড্রকারীদের তালিকা আনো (max limit জন)।
+    """
+    try:
+        if not RTDB_URL:
+            return []
+        ref = _rtdb_ref("stats/top_withdrawers")
+        if ref is None:
+            return []
+        data = ref.order_by_child("total").limit_to_last(limit).get()
+        if not data:
+            return []
+        items = [{"uid": k, **v} for k, v in data.items()]
+        items.sort(key=lambda x: x.get("total", 0), reverse=True)
+        return items
+    except Exception as e:
+        log.error(f"rtdb_get_top_withdrawers error: {e}")
+        return []
 
 # ═══════════════════════════════════════════════════════
 #   LOCAL CACHE  (RAM — TTL 120 সেকেন্ড)
@@ -404,6 +569,7 @@ def admin_kb():
         KeyboardButton("📋 উইথড্র হিস্ট্রি"),
         KeyboardButton("👥 একটিভ ইউজার লিস্ট"),
         KeyboardButton("🏆 টপ রেফারার"),
+        KeyboardButton("🏧 টপ উইথড্রয়ার"),
         KeyboardButton("📢 ব্রডকাস্ট করুন"),
         KeyboardButton("⚙️ সেটিংস দেখুন"),
         KeyboardButton("🏠 মেইন মেনু"),
@@ -701,9 +867,9 @@ async def pay_sender_phone(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ নম্বর সেভ হয়েছে: <code>{phone}</code>\n\n"
         f"🆔 এখন আপনার <b>ট্রান্জেকশন আইডি (TxnID)</b> দিন:\n\n"
-        f"{'📱 বিকাশ/নগদ TxnID: ঠিক ১০/৮ অক্ষর।' if method=='bkash' else '💚 নগদ TxnID: ঠিক ৮ অক্ষর।📳'}\n"
+        f"{'📱 বিকাশ TxnID: ঠিক ১০ অক্ষর।' if method=='bkash' else '💚 নগদ TxnID: ঠিক ৮ অক্ষর।'}\n"
         f"{'উদাহরণ: <code>DDO8HH4U5K</code>' if method=='bkash' else 'উদাহরণ: <code>AB12CD34</code>'}\n"
-        f"(একই TxnID ব্যবহার করবেন না।✖️ সঠিক TxnID দিন,তা না হলে রিজেক্ট❌ করে দেওয়া হবে। ৩ বার ভুল দিলে একাউন্ট ব্যান ❎)"
+        f"(ছোট হাতে লিখলেও স্বয়ংক্রিয়ভাবে বড় হাতে হয়ে যাবে)"
     )
 
 def _validate_txn(txn: str, method: str) -> tuple[bool, str]:
@@ -830,19 +996,21 @@ async def cb_approve_ver(call: types.CallbackQuery):
     vid   = parts[1] if len(parts) > 1 else None
     s     = get_settings()
 
+    # approve করার আগে পুরনো status দেখো
+    existing_user   = get_user(uid) or {}
+    was_ever_active = existing_user.get("status") == "active"
+
     update_user(uid, {"status": "active", "verifiedAt": int(time.time() * 1000)})
     if vid:
         fs_update("verifications", vid, {"status": "approved", "approvedAt": int(time.time() * 1000)})
 
     # stats counter — Firestore Increment (race-safe)
+    # total_users শুধু তখনই +১ হবে যখন ইউজার আগে কখনো active ছিল না
     try:
-        db.collection("stats").document("main").set(
-            {
-                "active_users": firestore.Increment(1),
-                "total_users":  firestore.Increment(1),
-            },
-            merge=True
-        )
+        stats_update = {"active_users": firestore.Increment(1)}
+        if not was_ever_active:
+            stats_update["total_users"] = firestore.Increment(1)
+        db.collection("stats").document("main").set(stats_update, merge=True)
     except Exception:
         pass
 
@@ -867,6 +1035,9 @@ async def cb_approve_ver(call: types.CallbackQuery):
         fs_txn_add(ref_uid, balance_delta=earn, points_delta=REF_POINTS)
         # referStats নোড আপডেট — টপ রেফারারের জন্য
         increment_refer_stat(ref_uid)
+        # ✅ RTDB-তে রেফার stats আপডেট
+        ref_name = (get_user(ref_uid) or {}).get("name", "?")
+        rtdb_stats_update_refer(ref_uid, ref_name, earn)
         try:
             await bot.send_message(
                 int(ref_uid),
@@ -877,6 +1048,9 @@ async def cb_approve_ver(call: types.CallbackQuery):
             )
         except Exception:
             pass
+
+    # ✅ RTDB-তে ভেরিফিকেশন ও ইনকাম stats আপডেট
+    rtdb_stats_new_verification(float(s.get("fee", 50)))
 
     try:
         await bot.send_message(
@@ -1170,7 +1344,7 @@ async def menu_handler(message: types.Message, state: FSMContext):
             f"• রেফার আয়: ৳{s['earn3']}\n"
             f"• সর্বনিম্ন উত্তোলন: ৳১০০\n\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"☀️ ডেইলি বোনাস: +{s['dailyBonus']} পয়েন্ট❇️ আর প্রতি রেফারে পাবেন ১০০ পয়েন্ট 💠\n\n"
+            f"☀️ ডেইলি বোনাস: +{s['dailyBonus']} পয়েন্ট\n\n"
             f"⚠️ <b>গুরুত্বপূর্ণ নিয়ম:</b>\n"
             f"• জালিয়াতি করলে স্থায়ী ব্যান\n"
             f"• একটি আইডিতে একটি অ্যাকাউন্ট\n"
@@ -1350,6 +1524,9 @@ async def cb_mark_paid(call: types.CallbackQuery):
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
     fs_update("withdrawals", wid, {"status": "paid", "paidAt": int(time.time() * 1000)})
+    # ✅ RTDB-তে উইথড্র stats আপডেট
+    w_name = w.get("name", "?")
+    rtdb_stats_new_withdrawal(amount, uid, w_name)
     await _notify_user_paid(uid, w)
 
     old_text = call.message.text or ""
@@ -1424,8 +1601,8 @@ async def watch_admin_paid_notifications():
     Admin Panel থেকে paid করলে ইউজারকে notify করে।
     প্রতি ৮ সেকেন্ডে চেক করে।
     ✅ শুধু adminPaidNotify আছে এমন docs আনে — পুরো collection নয়।
+    ✅ notified_wids set সরানো হয়েছে — Firestore field মুছলেই যথেষ্ট।
     """
-    notified_wids: set = set()
     while True:
         try:
             docs = db.collection("withdrawals")\
@@ -1434,14 +1611,12 @@ async def watch_admin_paid_notifications():
                 .get()
             for doc in docs:
                 wid = doc.id
-                if wid in notified_wids:
-                    continue
                 w = doc.to_dict()
                 notify_uid = w.get("adminPaidNotify")
                 if notify_uid and w.get("status") in ("paid", "success"):
                     await _notify_user_paid(notify_uid, w)
+                    # field মুছে দিলে পরের query-তে আর আসবে না
                     fs_update("withdrawals", wid, {"adminPaidNotify": firestore.DELETE_FIELD})
-                    notified_wids.add(wid)
         except Exception as e:
             log.debug(f"watch_admin_paid_notifications error: {e}")
         await asyncio.sleep(8)
@@ -1539,14 +1714,40 @@ async def admin_handler(message: types.Message, state: FSMContext):
         except Exception:
             rev = 0
 
+        # ✅ RTDB থেকে সব financial stats — মাত্র ১টা read
+        rtdb_main = rtdb_get_dashboard()
+        total_income       = rtdb_main.get("total_income", 0)
+        daily_inc          = rtdb_main.get(f"daily_{today_key}", 0)
+        total_verif        = rtdb_main.get("total_verifications", 0)
+        total_withdr       = rtdb_main.get("total_withdrawals", 0)
+        total_withdr_amt   = rtdb_main.get("total_withdrawal_amount", 0)
+        total_refer_paid   = rtdb_main.get("total_refer_paid", 0)
+        # daily income আলাদা নোড থেকে
+        try:
+            if RTDB_URL:
+                di_ref = _rtdb_ref(f"stats/daily_income/{today_key}")
+                daily_inc = di_ref.get() or 0 if di_ref else 0
+        except Exception:
+            daily_inc = 0
+        total_transaction  = round(float(total_income or 0) + float(total_refer_paid or 0), 2)
+
         await message.answer(
             f"📊 <b>লাইভ ড্যাশবোর্ড</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"👥 মোট ইউজার:          {bn(total)}\n"
-            f"✅ একটিভ ইউজার:        {bn(active_u)}\n"
-            f"⏳ ভেরিফিকেশন পেন্ডিং: {bn(ver_pend)}\n"
-            f"💸 উইথড্র পেন্ডিং:    {bn(wit_pend)}\n"
-            f"💰 আজকের রেভিনিউ:     ৳{rev}\n"
+            f"👥 মোট ইউজার:             {bn(total)}\n"
+            f"✅ একটিভ ইউজার:           {bn(active_u)}\n"
+            f"⏳ ভেরিফিকেশন পেন্ডিং:   {bn(ver_pend)}\n"
+            f"💸 উইথড্র পেন্ডিং:       {bn(wit_pend)}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💰 আজকের রেভিনিউ:        ৳{rev}\n"
+            f"📅 আজকের মোট ইনকাম:     ৳{bn(daily_inc)}\n"
+            f"💵 সর্বমোট ইনকাম:        ৳{bn(total_income)}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🔖 মোট ভেরিফিকেশন:      {bn(total_verif)} টি\n"
+            f"🏧 মোট উইথড্র:          {bn(total_withdr)} টি\n"
+            f"💸 মোট উইথড্র পরিমাণ:   ৳{bn(total_withdr_amt)}\n"
+            f"🤝 মোট রেফার পেমেন্ট:   ৳{bn(total_refer_paid)}\n"
+            f"🔄 মোট লেনদেন:          ৳{bn(total_transaction)}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
         )
@@ -1702,37 +1903,75 @@ async def admin_handler(message: types.Message, state: FSMContext):
             )
         await message.answer("\n".join(lines))
 
-    # ── টপ রেফারার — ✅ referStats থেকে আনো, পুরো users নয় ──
+    # ── টপ রেফারার — ✅ RTDB থেকে ১০০ জন, ১টা read ──
     elif "🏆 টপ রেফারার" in txt:
         await message.answer("⏳ টপ রেফারার লোড হচ্ছে...")
-        try:
-            docs = db.collection("referStats")\
-                .order_by("count", direction=firestore.Query.DESCENDING)\
-                .limit(10)\
-                .get()
-        except Exception as e:
-            await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
-            return
+        items = rtdb_get_top_referrers(100)
 
-        if not docs:
+        if not items:
+            # fallback: Firestore referStats থেকে আনো
+            try:
+                docs = db.collection("referStats")\
+                    .order_by("count", direction=firestore.Query.DESCENDING)\
+                    .limit(10)\
+                    .get()
+                items = [{"uid": d.id, "name": None, "count": d.to_dict().get("count", 0)} for d in docs]
+            except Exception as e:
+                await message.answer(f"❌ ডেটা আনতে সমস্যা: {e}")
+                return
+
+        if not items:
             await message.answer("🏆 এখনো কোনো রেফার হয়নি।")
             return
 
-        lines = ["🏆 <b>টপ রেফারার (শীর্ষ ১০)</b>\n"]
-        medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-        for i, doc in enumerate(docs):
-            uid_key = doc.id
-            count   = doc.to_dict().get("count", 0)
-            # cache থেকে আসবে বেশিরভাগ সময় — মাত্র ১০টা read
-            u = get_user(uid_key) or {}
-            lines.append(
-                f"{medals[i]} {u.get('name','?')} | "
-                f"📞 {u.get('phone','?')}\n"
-                f"   👥 রেফার: {bn(count)} জন | "
-                f"💰 ৳{u.get('balance',0)} | "
-                f"🎯 {bn(u.get('points',0))} পয়েন্ট\n"
-            )
-        await message.answer("\n".join(lines))
+        medals = ["🥇","🥈","🥉"] + [f"{i}️⃣" for i in range(4, 11)] + \
+                 [f"<b>{i}</b>" for i in range(11, 101)]
+
+        # ১০ জন করে ভাগ করে পাঠাও (Telegram message limit)
+        chunk_size = 20
+        for chunk_start in range(0, min(len(items), 100), chunk_size):
+            chunk = items[chunk_start:chunk_start + chunk_size]
+            lines = [f"🏆 <b>টপ রেফারার ({chunk_start+1}–{chunk_start+len(chunk)})</b>\n"]
+            for i, item in enumerate(chunk):
+                rank     = chunk_start + i
+                uid_key  = item.get("uid", "?")
+                count    = item.get("count", 0)
+                name     = item.get("name") or (get_user(uid_key) or {}).get("name", "?")
+                medal    = medals[rank] if rank < len(medals) else f"<b>{rank+1}</b>"
+                lines.append(
+                    f"{medal} {name}\n"
+                    f"   👥 রেফার: {bn(count)} জন\n"
+                )
+            await message.answer("\n".join(lines))
+            await asyncio.sleep(0.3)
+
+    # ── টপ উইথড্রয়ার — ✅ RTDB থেকে ১০০ জন, ১টা read ──
+    elif "🏧 টপ উইথড্রয়ার" in txt:
+        await message.answer("⏳ টপ উইথড্রয়ার লোড হচ্ছে...")
+        items = rtdb_get_top_withdrawers(100)
+
+        if not items:
+            await message.answer("🏧 এখনো কোনো উইথড্র হয়নি।")
+            return
+
+        medals = ["🥇","🥈","🥉"] + [f"{i}️⃣" for i in range(4, 11)] + \
+                 [f"<b>{i}</b>" for i in range(11, 101)]
+
+        chunk_size = 20
+        for chunk_start in range(0, min(len(items), 100), chunk_size):
+            chunk = items[chunk_start:chunk_start + chunk_size]
+            lines = [f"🏧 <b>টপ উইথড্রয়ার ({chunk_start+1}–{chunk_start+len(chunk)})</b>\n"]
+            for i, item in enumerate(chunk):
+                rank  = chunk_start + i
+                name  = item.get("name", "?")
+                total = item.get("total", 0)
+                medal = medals[rank] if rank < len(medals) else f"<b>{rank+1}</b>"
+                lines.append(
+                    f"{medal} {name}\n"
+                    f"   💸 মোট উইথড্র: ৳{bn(total)}\n"
+                )
+            await message.answer("\n".join(lines))
+            await asyncio.sleep(0.3)
 
     else:
         pass
