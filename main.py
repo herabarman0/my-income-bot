@@ -427,7 +427,10 @@ def put_user(uid: str, data: dict):
     cache_set_user(uid, data)
 
 # ═══════════════════════════════════════════════════════
-#   SETTINGS CACHE  (TTL 60 সেকেন্ড)
+#   SETTINGS CACHE
+#   ✅ Realtime Database থেকে পড়ে — Admin Panel সাথে সাথে sync।
+#   TTL 60 সেকেন্ড — প্রতি মিনিটে একবার fresh হয়।
+#   Admin Panel settings save করলে সর্বোচ্চ ৬০ সেকেন্ডে bot পাবে।
 # ═══════════════════════════════════════════════════════
 SETTINGS_TTL = 60
 _settings_cache: dict = {"data": None, "ts": 0.0}
@@ -437,7 +440,19 @@ def get_settings() -> dict:
     if _settings_cache["data"] and (now - _settings_cache["ts"]) < SETTINGS_TTL:
         return _settings_cache["data"]
 
-    s = fs_get("config", "settings") or {}
+    # ✅ Realtime Database থেকে পড়ো — Admin Panel এখানেই লেখে
+    s = {}
+    if RTDB_URL:
+        try:
+            s = rtdb.reference("settings").get() or {}
+        except Exception as e:
+            log.error(f"get_settings RTDB error: {e}")
+            # fallback: Firestore থেকে পড়ো
+            s = fs_get("config", "settings") or {}
+    else:
+        # RTDB না থাকলে Firestore fallback
+        s = fs_get("config", "settings") or {}
+
     result = {
         "bkash":      s.get("bkash",      "01XXXXXXXXX"),
         "nagad":      s.get("nagad",      "01XXXXXXXXX"),
