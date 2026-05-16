@@ -33,7 +33,8 @@ flask_app = Flask('')
 
 @flask_app.route('/')
 def home():
-    cache_count = len(_user_cache)
+    with _cache_lock:
+        cache_count = len(_user_cache)
     return f"IncomeApp Bot ✅ Running | Cache: {cache_count} users"
 
 @flask_app.route('/health')
@@ -63,6 +64,16 @@ bot     = Bot(token=API_TOKEN, parse_mode="HTML")
 dp      = Dispatcher(bot, storage=storage)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log     = logging.getLogger(__name__)
+
+# ✅ bot username একবার নিয়ে cache করি — প্রতিবার bot.get_me() API call করতে হবে না
+_bot_username: str | None = None
+
+async def get_bot_username() -> str:
+    global _bot_username
+    if _bot_username is None:
+        me = await bot.get_me()
+        _bot_username = me.username
+    return _bot_username
 
 # ═══════════════════════════════════════════════════════
 #   FIREBASE INITIALIZATION
@@ -193,10 +204,13 @@ def fs_txn_add(uid: str, balance_delta: float = 0, points_delta: int = 0) -> boo
             data = snapshot.to_dict()
             updates = {}
             if balance_delta != 0:
-                new_bal = round(max(0, data.get("balance", 0) + balance_delta), 2)
+                # ✅ type cast — Admin Panel থেকে string আসলেও সমস্যা নেই
+                cur_bal = float(data.get("balance", 0) or 0)
+                new_bal = round(max(0, cur_bal + float(balance_delta)), 2)
                 updates["balance"] = new_bal
             if points_delta != 0:
-                new_pts = max(0, data.get("points", 0) + points_delta)
+                cur_pts = int(float(data.get("points", 0) or 0))
+                new_pts = max(0, cur_pts + int(points_delta))
                 updates["points"] = new_pts
             transaction.update(user_ref, updates)
             return True
@@ -212,12 +226,12 @@ def fs_txn_add(uid: str, balance_delta: float = 0, points_delta: int = 0) -> boo
 
 def increment_refer_stat(referrer_uid: str):
     """
-    রেফার হলে referStats collection-এ +১ করে।
-    টপ রেফারার দেখাতে পুরো users স্ক্যান লাগবে না।
+    রেফার approve হলে referStats collection-এ count ও activeCount +১।
+    প্রোফাইলে active_refs আর আলাদা query লাগবে না।
     """
     try:
         ref = db.collection("referStats").document(referrer_uid)
-        ref.set({"count": firestore.Increment(1)}, merge=True)
+        ref.set({"count": firestore.Increment(1), "activeCount": firestore.Increment(1)}, merge=True)
     except Exception as e:
         log.error(f"increment_refer_stat error: {e}")
 
@@ -257,6 +271,7 @@ def rtdb_stats_new_verification(fee: float):
     → total_verifications +1
     → total_income += fee
     → daily_income[আজকের তারিখ] += fee
+    → pending_verifications -1 (dashboard-এ Firestore scan লাগবে না)
     """
     try:
         if not RTDB_URL:
@@ -265,6 +280,7 @@ def rtdb_stats_new_verification(fee: float):
         rtdb_increment("stats/main/total_verifications", 1)
         rtdb_increment("stats/main/total_income", fee)
         rtdb_increment(f"stats/daily_income/{today_key}", fee)
+        rtdb_increment("stats/main/pending_verifications", -1)  # ✅ pending -1
     except Exception as e:
         log.error(f"rtdb_stats_new_verification error: {e}")
 
@@ -273,6 +289,7 @@ def rtdb_stats_new_withdrawal(amount: float, uid: str, name: str):
     উইথড্র paid হলে কল করো।
     → total_withdrawals +1
     → total_withdrawal_amount += amount
+    → pending_withdrawals -1
     → top100_withdrawers আপডেট
     """
     try:
@@ -280,6 +297,7 @@ def rtdb_stats_new_withdrawal(amount: float, uid: str, name: str):
             return
         rtdb_increment("stats/main/total_withdrawals", 1)
         rtdb_increment("stats/main/total_withdrawal_amount", amount)
+        rtdb_increment("stats/main/pending_withdrawals", -1)  # ✅ pending -1
         # top withdrawer entry আপডেট
         w_ref = _rtdb_ref(f"stats/top_withdrawers/{uid}")
         if w_ref:
@@ -373,33 +391,38 @@ def rtdb_get_top_withdrawers(limit: int = 100) -> list:
 # ═══════════════════════════════════════════════════════
 #   LOCAL CACHE  (RAM — TTL 120 সেকেন্ড)
 # ═══════════════════════════════════════════════════════
+import threading
+
 MAX_CACHE_SIZE = 5000
 USER_CACHE_TTL = 120
 _user_cache: dict = {}
+_cache_lock = threading.Lock()  # ✅ Flask thread ও bot thread একসাথে access করলে safe
 
 def cache_get_user(uid: str):
-    entry = _user_cache.get(uid)
-    if entry is None:
-        return None
-    if (time.time() - entry["ts"]) > USER_CACHE_TTL:
-        del _user_cache[uid]
-        return None
-    return entry["data"]
+    with _cache_lock:
+        entry = _user_cache.get(uid)
+        if entry is None:
+            return None
+        if (time.time() - entry["ts"]) > USER_CACHE_TTL:
+            del _user_cache[uid]
+            return None
+        return entry["data"]
 
 def cache_set_user(uid: str, data: dict):
     if not data:
         return
-    if len(_user_cache) >= MAX_CACHE_SIZE:
-        remove_count = MAX_CACHE_SIZE // 10
-        # ✅ সবচেয়ে পুরনো entries আগে বের করো (timestamp অনুযায়ী)
-        oldest_keys = sorted(_user_cache, key=lambda k: _user_cache[k]["ts"])[:remove_count]
-        for key in oldest_keys:
-            del _user_cache[key]
-        log.debug(f"Cache evicted {remove_count} oldest entries")
-    _user_cache[uid] = {"data": dict(data), "ts": time.time()}
+    with _cache_lock:
+        if len(_user_cache) >= MAX_CACHE_SIZE:
+            remove_count = MAX_CACHE_SIZE // 10
+            oldest_keys = sorted(_user_cache, key=lambda k: _user_cache[k]["ts"])[:remove_count]
+            for key in oldest_keys:
+                del _user_cache[key]
+            log.debug(f"Cache evicted {remove_count} oldest entries")
+        _user_cache[uid] = {"data": dict(data), "ts": time.time()}
 
 def cache_invalidate_user(uid: str):
-    _user_cache.pop(uid, None)
+    with _cache_lock:
+        _user_cache.pop(uid, None)
     log.debug(f"Cache invalidated: {uid}")
 
 def get_user(uid: str) -> dict | None:
@@ -425,6 +448,13 @@ def put_user(uid: str, data: dict):
     """Firestore-এ নতুন ইউজার + cache set।"""
     fs_set_user(uid, data)
     cache_set_user(uid, data)
+    # ✅ phone_index — Admin Panel-এ ফোন নম্বর দিয়ে ইউজার খুঁজতে
+    phone = data.get("phone", "")
+    if phone and RTDB_URL:
+        try:
+            rtdb.reference(f"phone_index/{phone}").set(uid)
+        except Exception as _pe:
+            log.error(f"phone_index write error: {_pe}")
 
 # ═══════════════════════════════════════════════════════
 #   SETTINGS CACHE
@@ -454,19 +484,21 @@ def get_settings() -> dict:
         s = fs_get("config", "settings") or {}
 
     result = {
-        "bkash":      s.get("bkash",      "01XXXXXXXXX"),
-        "nagad":      s.get("nagad",      "01XXXXXXXXX"),
-        "fee":        s.get("fee",        50),
-        "notice":     s.get("notice",     ""),
-        "popup":      s.get("popup",      ""),
-        "appOn":      s.get("appOn",      True),
-        "regOn":      s.get("regOn",      True),
-        "lvl2Start":  s.get("lvl2Start",  1000),
-        "lvl3Start":  s.get("lvl3Start",  2000),
-        "earn1":      s.get("earn1",      20),
-        "earn2":      s.get("earn2",      25),
-        "earn3":      s.get("earn3",      30),
-        "dailyBonus": s.get("dailyBonus", 10),
+        "bkash":      str(s.get("bkash",      "01XXXXXXXXX")),
+        "nagad":      str(s.get("nagad",      "01XXXXXXXXX")),
+        "fee":        float(s.get("fee",        50)),
+        "notice":     str(s.get("notice",     "")),
+        "popup":      str(s.get("popup",      "")),
+        "appOn":      bool(s.get("appOn",      True)),
+        "regOn":      bool(s.get("regOn",      True)),
+        "lvl2Start":  int(float(s.get("lvl2Start",  1000))),
+        "lvl3Start":  int(float(s.get("lvl3Start",  2000))),
+        "earn1":      float(s.get("earn1",      20)),
+        "earn2":      float(s.get("earn2",      25)),
+        "earn3":      float(s.get("earn3",      30)),
+        "dailyBonus": int(float(s.get("dailyBonus", 10))),
+        "supportTg":  str(s.get("supportTg",  "support_username")),
+        "supportWa":  str(s.get("supportWa",  "01XXXXXXXXX")),
     }
     _settings_cache["data"] = result
     _settings_cache["ts"]   = now
@@ -529,7 +561,7 @@ def bn(n) -> str:
         d = {'0':'০','1':'১','2':'২','3':'৩','4':'৪',
              '5':'৫','6':'৬','7':'৭','8':'৮','9':'৯','.':'.','-':'-'}
         return ''.join(d.get(c, c) for c in s)
-    except:
+    except (ValueError, TypeError):
         return "০"
 
 # ═══════════════════════════════════════════════════════
@@ -553,10 +585,18 @@ class Report(StatesGroup):
     message = State()
 
 class AdminState(StatesGroup):
-    broadcast     = State()
-    edit_uid      = State()
-    edit_field    = State()
-    edit_value    = State()
+    broadcast      = State()
+    edit_uid       = State()
+    edit_field     = State()
+    edit_value     = State()
+    # নতুন অপশনের জন্য
+    search_user    = State()   # ইউজার খোঁজা
+    admin_edit_uid = State()   # কোন ইউজার এডিট করবেন
+    admin_edit_bal = State()   # ব্যালেন্স পরিমাণ
+    admin_edit_pts = State()   # পয়েন্ট পরিমাণ
+    ban_uid        = State()   # ব্যান করতে UID
+    set_field      = State()   # কোন setting বদলাবেন
+    set_value      = State()   # নতুন মান
 
 # ═══════════════════════════════════════════════════════
 #   KEYBOARDS
@@ -583,10 +623,14 @@ def admin_kb():
         KeyboardButton("💸 পেন্ডিং উইথড্রয়াল"),
         KeyboardButton("📋 উইথড্র হিস্ট্রি"),
         KeyboardButton("👥 একটিভ ইউজার লিস্ট"),
+        KeyboardButton("🔍 ইউজার খুঁজুন"),
+        KeyboardButton("✏️ ইউজার এডিট"),
+        KeyboardButton("🚫 ব্যান/আনব্যান"),
         KeyboardButton("🏆 টপ রেফারার"),
         KeyboardButton("🏧 টপ উইথড্রয়ার"),
         KeyboardButton("📢 ব্রডকাস্ট করুন"),
         KeyboardButton("⚙️ সেটিংস দেখুন"),
+        KeyboardButton("🔧 সেটিংস আপডেট"),
         KeyboardButton("🏠 মেইন মেনু"),
     )
     return kb
@@ -653,14 +697,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
             await message.answer("❌ নতুন নিবন্ধন সাময়িকভাবে বন্ধ আছে।")
             return
         args = message.get_args()
-        ref_by = args if args else None
-        if ref_by:
-            try:
-                docs = db.collection("users").where("referCode", "==", ref_by).limit(1).get()
-                if not docs:
-                    ref_by = None
-            except Exception:
-                ref_by = None
+        ref_by = args.strip() if args else None
+        # ✅ /start-এ refer code verify করি না — registration-এ (reg_ref_code) verify হবে
+        # এতে একটা Firestore read বাঁচে প্রতিটা /start-এ
 
         await state.update_data(referred_by=ref_by, name=message.from_user.full_name)
         await Reg.phone.set()
@@ -731,6 +770,11 @@ async def _show_home(message, uid, user, s):
     )
     await message.answer(text, reply_markup=main_kb())
 
+    # ✅ Popup — Admin Panel থেকে সেট করা থাকলে আলাদা message পাঠাও
+    popup = s.get("popup", "").strip()
+    if popup:
+        await message.answer(f"📌 <b>বিজ্ঞপ্তি</b>\n\n{popup}")
+
 # ═══════════════════════════════════════════════════════
 #   REGISTRATION FLOW
 # ═══════════════════════════════════════════════════════
@@ -780,22 +824,27 @@ async def reg_ref_code(message: types.Message, state: FSMContext):
     s    = get_settings()
 
     referred_by_uid = None
+    # user টাইপ করা code অথবা /start-এ আসা code — একটাই query দিয়ে resolve করি
+    lookup_code = None
     if code != "SKIP" and code:
+        lookup_code = code
+    elif data.get("referred_by"):
+        lookup_code = data["referred_by"]  # /start থেকে আসা code
+
+    if lookup_code:
         try:
-            docs = db.collection("users").where("referCode", "==", code).limit(1).get()
+            docs = db.collection("users").where("referCode", "==", lookup_code).limit(1).get()
             if docs:
-                referred_by_uid = docs[0].id
-            else:
+                ref_uid = docs[0].id
+                # ✅ Self-refer prevention — নিজের কোড দিলে বোনাস পাবে না
+                if ref_uid == uid:
+                    await message.answer("⚠️ নিজের রেফার কোড ব্যবহার করা যাবে না। Skip করুন:")
+                    return
+                referred_by_uid = ref_uid
+            elif code != "SKIP" and code:
+                # user-এর টাইপ করা code ভুল — /start-এর code হলে silently skip
                 await message.answer("⚠️ রেফার কোড পাওয়া যায়নি। Skip করুন বা সঠিক কোড দিন:")
                 return
-        except Exception:
-            pass
-
-    if data.get("referred_by") and not referred_by_uid:
-        try:
-            docs = db.collection("users").where("referCode", "==", data["referred_by"]).limit(1).get()
-            if docs:
-                referred_by_uid = docs[0].id
         except Exception:
             pass
 
@@ -827,6 +876,16 @@ async def cb_start_pay(call: types.CallbackQuery, state: FSMContext):
     if not user:
         await call.answer("প্রথমে /start দিন।", show_alert=True)
         return
+    st = user.get("status", "")
+    if st == "active":
+        await call.answer("✅ আপনার একাউন্ট ইতোমধ্যে একটিভ আছে।", show_alert=True)
+        return
+    if st == "review":
+        await call.answer("⏳ আপনার পেমেন্ট রিভিউতে আছে। অপেক্ষা করুন।", show_alert=True)
+        return
+    if st == "banned":
+        await call.answer("🚫 আপনার একাউন্ট বন্ধ করা হয়েছে।", show_alert=True)
+        return
     s = get_settings()
     await Pay.choose_method.set()
     await call.message.answer(
@@ -844,6 +903,16 @@ async def cmd_pay(message: types.Message, state: FSMContext):
     user = get_user(uid)
     if not user:
         await message.answer("প্রথমে /start দিন।")
+        return
+    st = user.get("status", "")
+    if st == "active":
+        await message.answer("✅ আপনার একাউন্ট ইতোমধ্যে একটিভ আছে।", reply_markup=main_kb())
+        return
+    if st == "banned":
+        await message.answer("🚫 আপনার একাউন্ট বন্ধ করা হয়েছে। সাপোর্টে যোগাযোগ করুন।")
+        return
+    if st == "review":
+        await message.answer("⏳ আপনার পেমেন্ট রিভিউতে আছে। অ্যাডমিন চেক করছেন, অপেক্ষা করুন।")
         return
     s = get_settings()
     await Pay.choose_method.set()
@@ -969,6 +1038,7 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
     }
     vid = fs_add("verifications", ver_data)
     update_user(uid, {"status": "review"})
+    rtdb_increment("stats/main/pending_verifications", 1)  # ✅ dashboard counter
 
     admin_text = (
         f"🔔 <b>নতুন ভেরিফিকেশন রিকোয়েস্ট</b>\n"
@@ -1011,21 +1081,47 @@ async def cb_approve_ver(call: types.CallbackQuery):
     vid   = parts[1] if len(parts) > 1 else None
     s     = get_settings()
 
-    # approve করার আগে পুরনো status দেখো
-    existing_user   = get_user(uid) or {}
-    was_ever_active = existing_user.get("status") == "active"
+    # FIX 1: Transaction দিয়ে double-approve ঠেকাও
+    try:
+        user_ref = db.collection("users").document(uid)
 
-    update_user(uid, {"status": "active", "verifiedAt": int(time.time() * 1000)})
+        @firestore.transactional
+        def _approve_user(transaction, ref):
+            snap = ref.get(transaction=transaction)
+            if not snap.exists:
+                return "no_user"
+            d = snap.to_dict()
+            if d.get("status") == "active":
+                return "already_active"
+            transaction.update(ref, {
+                "status":     "active",
+                "verifiedAt": int(time.time() * 1000),
+            })
+            return "ok"
+
+        txn    = db.transaction()
+        result = _approve_user(txn, user_ref)
+        cache_invalidate_user(uid)
+    except Exception as e:
+        log.error(f"approve_ver txn error uid={uid}: {e}")
+        await call.message.answer(f"❌ Approve-এ সমস্যা হয়েছে: {e}")
+        return
+
+    if result == "no_user":
+        await call.message.answer(f"❌ ইউজার পাওয়া যায়নি! UID: {uid}")
+        return
+    if result == "already_active":
+        await call.message.answer(f"⚠️ এই ইউজার আগেই Active আছে! UID: <code>{uid}</code>")
+        return
+
     if vid:
         fs_update("verifications", vid, {"status": "approved", "approvedAt": int(time.time() * 1000)})
 
-    # stats counter — Firestore Increment (race-safe)
-    # total_users শুধু তখনই +১ হবে যখন ইউজার আগে কখনো active ছিল না
     try:
-        stats_update = {"active_users": firestore.Increment(1)}
-        if not was_ever_active:
-            stats_update["total_users"] = firestore.Increment(1)
-        db.collection("stats").document("main").set(stats_update, merge=True)
+        db.collection("stats").document("main").set({
+            "active_users": firestore.Increment(1),
+            "total_users":  firestore.Increment(1),
+        }, merge=True)
     except Exception:
         pass
 
@@ -1050,8 +1146,8 @@ async def cb_approve_ver(call: types.CallbackQuery):
         fs_txn_add(ref_uid, balance_delta=earn, points_delta=REF_POINTS)
         # referStats নোড আপডেট — টপ রেফারারের জন্য
         increment_refer_stat(ref_uid)
-        # ✅ RTDB-তে রেফার stats আপডেট
-        ref_name = (get_user(ref_uid) or {}).get("name", "?")
+        # ✅ RTDB-তে রেফার stats আপডেট (আগে আনা ref_user থেকেই নাম নিন)
+        ref_name = ref_user.get("name", "?")
         rtdb_stats_update_refer(ref_uid, ref_name, earn)
         try:
             await bot.send_message(
@@ -1100,6 +1196,7 @@ async def cb_reject_ver(call: types.CallbackQuery):
     update_user(uid, {"status": "rejected"})
     if vid:
         fs_update("verifications", vid, {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
+    rtdb_increment("stats/main/pending_verifications", -1)  # ✅ pending counter
 
     try:
         await bot.send_message(
@@ -1150,16 +1247,12 @@ async def menu_handler(message: types.Message, state: FSMContext):
 
     # ── হোম ──
     if txt == "🏠 হোম":
-        # cache invalidate করে fresh data আনো
-        cache_invalidate_user(uid)
-        user = get_user(uid) or user
+        # cache থেকেই আনো — update_user() call হলে auto-invalidate হয়
         await _show_home(message, uid, user, s)
 
     # ── প্রোফাইল ──
     elif txt == "📊 আমার প্রোফাইল":
-        # cache invalidate করে fresh আনো
-        cache_invalidate_user(uid)
-        user = get_user(uid) or user
+        # cache থেকেই আনো — update_user() call হলে auto-invalidate হয়
 
         pts  = user.get("points", 0)
         bal  = user.get("balance", 0)
@@ -1170,23 +1263,15 @@ async def menu_handler(message: types.Message, state: FSMContext):
         # ✅ referStats থেকে আনো — পুরো users স্ক্যান নয়
         try:
             ref_stat_doc = db.collection("referStats").document(uid).get()
-            total_refs = ref_stat_doc.to_dict().get("count", 0) if ref_stat_doc.exists else 0
+            ref_stat_data = ref_stat_doc.to_dict() if ref_stat_doc.exists else {}
+            total_refs  = ref_stat_data.get("count", 0)
+            active_refs = ref_stat_data.get("activeCount", 0)  # ✅ approve-এ আপডেট করা হবে
         except Exception:
             total_refs = 0
-
-        # active refs — শুধু এই ইউজারের রেফার করা active users গণনা
-        try:
-            active_docs = db.collection("users")\
-                .where("referredBy", "==", uid)\
-                .where("status", "==", "active")\
-                .select([])\
-                .get()
-            active_refs = len(active_docs)
-        except Exception:
             active_refs = 0
 
-        me       = await bot.get_me()
-        ref_link = f"https://t.me/{me.username}?start={user.get('referCode','')}"
+        bot_username = await get_bot_username()  # ✅ cached — API call নয়
+        ref_link = f"https://t.me/{bot_username}?start={user.get('referCode','')}"
 
         lvl2 = s["lvl2Start"]
         lvl3 = s["lvl3Start"]
@@ -1220,9 +1305,9 @@ async def menu_handler(message: types.Message, state: FSMContext):
 
     # ── রেফার ──
     elif txt == "👥 রেফার করুন":
-        me       = await bot.get_me()
+        bot_username = await get_bot_username()  # ✅ cached
         ref_code = user.get("referCode", "")
-        ref_link = f"https://t.me/{me.username}?start={ref_code}"
+        ref_link = f"https://t.me/{bot_username}?start={ref_code}"
         lvl      = get_level(user.get("points", 0), s)
         earn     = get_earn(lvl, s)
 
@@ -1489,7 +1574,19 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
         "status":      "pending",
         "requestedAt": int(time.time() * 1000),
     })
+
+    # ✅ fs_add ফেল করলে balance ফেরত দিন
+    if not wid:
+        fs_txn_add(uid, balance_delta=+amount)
+        await message.answer(
+            "❌ আবেদন সংরক্ষণে সমস্যা হয়েছে। আপনার ব্যালেন্স ফেরত দেওয়া হয়েছে।\nআবার চেষ্টা করুন।",
+            reply_markup=main_kb()
+        )
+        await state.finish()
+        return
+
     await state.finish()
+    rtdb_increment("stats/main/pending_withdrawals", 1)  # ✅ dashboard counter
 
     admin_text = (
         f"💸 <b>উইথড্রয়াল রিকোয়েস্ট</b>\n"
@@ -1538,7 +1635,7 @@ async def cb_mark_paid(call: types.CallbackQuery):
 
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
-    fs_update("withdrawals", wid, {"status": "paid", "paidAt": int(time.time() * 1000)})
+    fs_update("withdrawals", wid, {"status": "paid", "paidAt": int(time.time() * 1000), "notifyPending": True})  # ✅ FIX 2: watcher এটা দেখে notify করবে
     # ✅ RTDB-তে উইথড্র stats আপডেট
     w_name = w.get("name", "?")
     rtdb_stats_new_withdrawal(amount, uid, w_name)
@@ -1576,6 +1673,7 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
     uid    = w.get("uid")
     amount = float(w.get("amount", 0))
     fs_txn_add(uid, balance_delta=+amount)
+    rtdb_increment("stats/main/pending_withdrawals", -1)  # ✅ pending counter
     await _notify_user_rejected(uid, w)
 
     old_text = call.message.text or ""
@@ -1613,31 +1711,75 @@ async def _notify_user_rejected(uid: str, w: dict):
 
 async def watch_admin_paid_notifications():
     """
-    Admin Panel থেকে paid করলে ইউজারকে notify করে।
+    FIX 2: Admin Panel থেকে paid করলে ইউজারকে notify করে।
+    notifyPending=True field দিয়ে চেক করে — আগের >= query কাজ করত না।
+    Admin Panel-এ cb_mark_paid এ notifyPending=True সেট করতে হবে।
     প্রতি ৮ সেকেন্ডে চেক করে।
-    ✅ শুধু adminPaidNotify আছে এমন docs আনে — পুরো collection নয়।
-    ✅ notified_wids set সরানো হয়েছে — Firestore field মুছলেই যথেষ্ট।
     """
     while True:
         try:
+            # ✅ notifyPending=True field দিয়ে query — সঠিকভাবে কাজ করে
             docs = db.collection("withdrawals")\
-                .where("adminPaidNotify", "!=", None)\
+                .where("notifyPending", "==", True)\
                 .limit(20)\
                 .get()
             for doc in docs:
                 wid = doc.id
-                w = doc.to_dict()
-                notify_uid = w.get("adminPaidNotify")
-                if notify_uid and w.get("status") in ("paid", "success"):
+                w   = doc.to_dict()
+                notify_uid = w.get("uid")
+                if notify_uid:
+                    # ✅ আগে field মুছো — duplicate notify ঠেকাতে
+                    fs_update("withdrawals", wid, {"notifyPending": firestore.DELETE_FIELD})
                     await _notify_user_paid(notify_uid, w)
-                    # field মুছে দিলে পরের query-তে আর আসবে না
-                    fs_update("withdrawals", wid, {"adminPaidNotify": firestore.DELETE_FIELD})
+                    # ✅ Admin Panel থেকে paid করলে RTDB stats আপডেট
+                    try:
+                        amt  = float(w.get("amount", 0))
+                        name = w.get("name", "?")
+                        rtdb_stats_new_withdrawal(amt, notify_uid, name)
+                    except Exception as _se:
+                        log.error(f"watch stats update error: {_se}")
+                    log.info(f"Admin paid notify sent: uid={notify_uid} wid={wid}")
         except Exception as e:
             log.debug(f"watch_admin_paid_notifications error: {e}")
         await asyncio.sleep(8)
 
+# ═══════════════════════════════════════════════════════
+#   REPORT LOCAL CACHE
+#   Report আসার সাথে সাথে memory-তে সেভ হয়, Firestore থেকে সাথে সাথে মুছে যায়।
+#   Admin /reports দিলে memory থেকে দেখা যায়, সমাধান হলে delete করা যায়।
+# ═══════════════════════════════════════════════════════
+_report_cache: list = []   # [{"idx","uid","name","phone","msg","ts"}, ...]
+MAX_REPORT_CACHE = 200
+_report_idx_counter = 0    # প্রতিটা report-এর unique index (delete-এর জন্য)
+
+def report_cache_add(uid: str, name: str, phone: str, text: str) -> int:
+    """নতুন report local cache-এ যোগ করো। unique index return করো।"""
+    global _report_idx_counter
+    _report_idx_counter += 1
+    idx = _report_idx_counter
+    _report_cache.append({
+        "idx":   idx,
+        "uid":   uid,
+        "name":  name,
+        "phone": phone,
+        "msg":   text,
+        "ts":    int(time.time() * 1000),
+    })
+    # পুরনো reports ছাঁটাও
+    if len(_report_cache) > MAX_REPORT_CACHE:
+        _report_cache.pop(0)
+    return idx
+
+def report_cache_delete(idx: int) -> bool:
+    """index দিয়ে report cache থেকে মুছো। সফল হলে True।"""
+    for i, r in enumerate(_report_cache):
+        if r["idx"] == idx:
+            _report_cache.pop(i)
+            return True
+    return False
+
 async def _auto_delete_report(rid: str):
-    await asyncio.sleep(5)
+    """Firestore থেকে সাথে সাথেই মুছো — cache-এ আছে।"""
     fs_delete("reports", rid)
 
 # ═══════════════════════════════════════════════════════
@@ -1665,6 +1807,9 @@ async def report_message(message: types.Message, state: FSMContext):
     update_user(uid, {"lastReport": int(time.time() * 1000)})
     await state.finish()
 
+    # ✅ আগে local memory-তে সেভ করো
+    report_cache_add(uid, user.get("name","?"), user.get("phone","?"), raw_text)
+
     report_text = (
         f"🚨 <b>নতুন রিপোর্ট</b>\n"
         f"👤 {user.get('name','?')} | 📞 {user.get('phone','?')}\n"
@@ -1678,6 +1823,7 @@ async def report_message(message: types.Message, state: FSMContext):
 
     await message.answer("✅ <b>রিপোর্ট পাঠানো হয়েছে।</b>\n\nঅ্যাডমিন শীঘ্রই ব্যবস্থা নেবেন।", reply_markup=main_kb())
 
+    # ✅ Firestore-এ সেভ করো তারপর সাথে সাথে মুছো — cache-এ আছে
     rid = fs_add("reports", {
         "uid":       uid,
         "name":      user.get("name", "?"),
@@ -1686,7 +1832,7 @@ async def report_message(message: types.Message, state: FSMContext):
         "createdAt": int(time.time() * 1000),
     })
     if rid:
-        asyncio.get_event_loop().create_task(_auto_delete_report(rid))
+        asyncio.create_task(_auto_delete_report(rid))  # FIX 3: ensure_future deprecated, create_task ব্যবহার করো
 
 # ═══════════════════════════════════════════════════════
 #   ADMIN MENU HANDLERS
@@ -1703,48 +1849,42 @@ async def admin_handler(message: types.Message, state: FSMContext):
 
     # ── ড্যাশবোর্ড ──
     if "📊 ড্যাশবোর্ড" in txt:
-        try:
-            # ✅ shallow — শুধু count আনো, পুরো data নয়
-            users_count_doc = db.collection("stats").document("main").get()
-            stats = users_count_doc.to_dict() if users_count_doc.exists else {}
-            total    = stats.get("total_users", "?")
-            active_u = stats.get("active_users", "?")
-        except Exception:
-            total, active_u = "?", "?"
-
-        # ✅ শুধু pending docs আনো
-        try:
-            ver_pend = len(db.collection("verifications").where("status", "==", "pending").select([]).get())
-        except Exception:
-            ver_pend = "?"
-        try:
-            wit_pend = len(db.collection("withdrawals").where("status", "==", "pending").select([]).get())
-        except Exception:
-            wit_pend = "?"
-
         today_key = date.today().strftime("%Y-%m-%d")
-        try:
-            rev_doc = db.collection("dailyRevenue").document(today_key).get()
-            rev = rev_doc.to_dict().get("amount", 0) if rev_doc.exists else 0
-        except Exception:
-            rev = 0
 
-        # ✅ RTDB থেকে সব financial stats — মাত্র ১টা read
+        # ✅ RTDB থেকে সব stats — মাত্র ১টা read (আগে ৫টা আলাদা read ছিল)
         rtdb_main = rtdb_get_dashboard()
-        total_income       = rtdb_main.get("total_income", 0)
-        daily_inc          = rtdb_main.get(f"daily_{today_key}", 0)
-        total_verif        = rtdb_main.get("total_verifications", 0)
-        total_withdr       = rtdb_main.get("total_withdrawals", 0)
-        total_withdr_amt   = rtdb_main.get("total_withdrawal_amount", 0)
-        total_refer_paid   = rtdb_main.get("total_refer_paid", 0)
-        # daily income আলাদা নোড থেকে
+        total_income     = rtdb_main.get("total_income", 0)
+        total_verif      = rtdb_main.get("total_verifications", 0)
+        total_withdr     = rtdb_main.get("total_withdrawals", 0)
+        total_withdr_amt = rtdb_main.get("total_withdrawal_amount", 0)
+        total_refer_paid = rtdb_main.get("total_refer_paid", 0)
+        ver_pend         = rtdb_main.get("pending_verifications", "?")
+        wit_pend         = rtdb_main.get("pending_withdrawals", "?")
+        total_transaction = round(float(total_income or 0) + float(total_refer_paid or 0), 2)
+
+        # daily income — আলাদা RTDB node
+        daily_inc = 0
         try:
             if RTDB_URL:
                 di_ref = _rtdb_ref(f"stats/daily_income/{today_key}")
                 daily_inc = di_ref.get() or 0 if di_ref else 0
         except Exception:
             daily_inc = 0
-        total_transaction  = round(float(total_income or 0) + float(total_refer_paid or 0), 2)
+
+        # Firestore: total/active users + আজকের revenue — ২টা doc read (unavoidable)
+        try:
+            users_count_doc = db.collection("stats").document("main").get()
+            stats    = users_count_doc.to_dict() if users_count_doc.exists else {}
+            total    = stats.get("total_users", "?")
+            active_u = stats.get("active_users", "?")
+        except Exception:
+            total, active_u = "?", "?"
+
+        try:
+            rev_doc = db.collection("dailyRevenue").document(today_key).get()
+            rev = rev_doc.to_dict().get("amount", 0) if rev_doc.exists else 0
+        except Exception:
+            rev = 0
 
         await message.answer(
             f"📊 <b>লাইভ ড্যাশবোর্ড</b>\n"
@@ -1829,6 +1969,53 @@ async def admin_handler(message: types.Message, state: FSMContext):
     elif "📢 ব্রডকাস্ট করুন" in txt:
         await AdminState.broadcast.set()
         await message.answer("📢 ব্রডকাস্ট মেসেজ লিখুন:\n(বাতিল: /cancel)")
+
+    # ── ইউজার খুঁজুন ──
+    elif "🔍 ইউজার খুঁজুন" in txt:
+        await AdminState.search_user.set()
+        await message.answer(
+            "🔍 <b>ইউজার খুঁজুন</b>\n\n"
+            "UID, ফোন নম্বর বা নাম লিখুন:\n"
+            "(বাতিল: /cancel)"
+        )
+
+    # ── ইউজার এডিট ──
+    elif "✏️ ইউজার এডিট" in txt:
+        await AdminState.admin_edit_uid.set()
+        await message.answer(
+            "✏️ <b>ইউজার এডিট</b>\n\n"
+            "যার ব্যালেন্স/পয়েন্ট পরিবর্তন করতে চান\n"
+            "তার UID বা ফোন নম্বর লিখুন:\n"
+            "(বাতিল: /cancel)"
+        )
+
+    # ── ব্যান/আনব্যান ──
+    elif "🚫 ব্যান/আনব্যান" in txt:
+        await AdminState.ban_uid.set()
+        await message.answer(
+            "🚫 <b>ব্যান / আনব্যান</b>\n\n"
+            "ইউজারের UID বা ফোন নম্বর লিখুন:\n"
+            "(বাতিল: /cancel)"
+        )
+
+    # ── সেটিংস আপডেট ──
+    elif "🔧 সেটিংস আপডেট" in txt:
+        s = get_settings()
+        await AdminState.set_field.set()
+        await message.answer(
+            f"🔧 <b>কোন সেটিং আপডেট করবেন?</b>\n\n"
+            f"1️⃣ বিকাশ নম্বর → <code>{s['bkash']}</code>\n"
+            f"2️⃣ নগদ নম্বর → <code>{s['nagad']}</code>\n"
+            f"3️⃣ ভেরিফিকেশন ফি → ৳{s['fee']}\n"
+            f"4️⃣ লেভেল ১ আয় → ৳{s['earn1']}\n"
+            f"5️⃣ লেভেল ২ আয় → ৳{s['earn2']}\n"
+            f"6️⃣ লেভেল ৩ আয় → ৳{s['earn3']}\n"
+            f"7️⃣ লেভেল ২ শুরু → {s['lvl2Start']} পয়েন্ট\n"
+            f"8️⃣ লেভেল ৩ শুরু → {s['lvl3Start']} পয়েন্ট\n"
+            f"9️⃣ ডেইলি বোনাস → {s['dailyBonus']} পয়েন্ট\n"
+            f"🔟 নোটিশ টেক্সট\n\n"
+            f"নম্বর লিখুন (১–১০):\n(বাতিল: /cancel)"
+        )
 
     # ── সেটিংস ──
     elif "⚙️ সেটিংস দেখুন" in txt:
@@ -2023,7 +2210,7 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
                 sent += 1
             except Exception:
                 failed += 1
-            await asyncio.sleep(0.034)
+            await asyncio.sleep(0.03)  # ~33 msg/sec — Telegram limit থেকে নিরাপদ
         if (i + BATCH) % 500 == 0 and i + BATCH < total_users:
             await message.answer(f"⏳ অগ্রগতি: {bn(i + BATCH)}/{bn(total_users)} জন সম্পন্ন...")
         if i + BATCH < total_users:
@@ -2035,6 +2222,319 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
         f"❌ ব্যর্থ: {bn(failed)} জন",
         reply_markup=admin_kb()
     )
+
+# ═══════════════════════════════════════════════════════
+#   ADMIN — ইউজার খোঁজা
+# ═══════════════════════════════════════════════════════
+@dp.message_handler(state=AdminState.search_user)
+async def admin_search_user(message: types.Message, state: FSMContext):
+    await state.finish()
+    query = message.text.strip()
+
+    results = []
+    # UID দিয়ে সরাসরি খোঁজো
+    try:
+        doc = db.collection("users").document(query).get()
+        if doc.exists:
+            results.append((doc.id, doc.to_dict()))
+    except Exception:
+        pass
+
+    # ফোন নম্বর দিয়ে খোঁজো
+    if not results:
+        try:
+            docs = db.collection("users").where("phone", "==", query).limit(5).get()
+            for d in docs:
+                results.append((d.id, d.to_dict()))
+        except Exception:
+            pass
+
+    # নাম দিয়ে খোঁজো (case-sensitive, Firestore limitation)
+    if not results:
+        try:
+            docs = db.collection("users")\
+                .where("name", ">=", query)\
+                .where("name", "<=", query + "\uf8ff")\
+                .limit(5).get()
+            for d in docs:
+                results.append((d.id, d.to_dict()))
+        except Exception:
+            pass
+
+    if not results:
+        await message.answer("🔍 কোনো ইউজার পাওয়া যায়নি।\nUID, ফোন নম্বর বা নাম দিয়ে খুঁজুন।", reply_markup=admin_kb())
+        return
+
+    s = get_settings()
+    for uid_key, u in results:
+        pts  = u.get("points", 0)
+        bal  = u.get("balance", 0)
+        lvl  = get_level(pts, s)
+        st   = u.get("status", "?")
+        icons = {"active":"✅","pending":"⏳","review":"🔍","rejected":"❌","banned":"🚫","new":"🆕"}
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✏️ এডিট", callback_data=f"admedit_{uid_key}"),
+            InlineKeyboardButton("🚫 ব্যান" if st != "banned" else "✅ আনব্যান", callback_data=f"admban_{uid_key}_{st}"),
+        )
+        await message.answer(
+            f"👤 <b>{u.get('name','?')}</b>\n"
+            f"📞 ফোন: <code>{u.get('phone','?')}</code>\n"
+            f"🆔 UID: <code>{uid_key}</code>\n"
+            f"💰 ব্যালেন্স: <b>৳{bal}</b>\n"
+            f"🎯 পয়েন্ট: <b>{pts}</b>\n"
+            f"🏅 লেভেল: {lvl}\n"
+            f"📌 স্ট্যাটাস: {icons.get(st,'❓')} {st}",
+            reply_markup=kb
+        )
+
+# ═══════════════════════════════════════════════════════
+#   ADMIN — ইউজার এডিট (FSM)
+# ═══════════════════════════════════════════════════════
+@dp.message_handler(state=AdminState.admin_edit_uid)
+async def admin_edit_get_uid(message: types.Message, state: FSMContext):
+    uid_input = message.text.strip()
+    u = get_user(uid_input)
+    if not u:
+        # ফোন দিয়েও চেষ্টা করো
+        try:
+            docs = db.collection("users").where("phone", "==", uid_input).limit(1).get()
+            if docs:
+                uid_input = docs[0].id
+                u = docs[0].to_dict()
+        except Exception:
+            pass
+    if not u:
+        await message.answer("❌ ইউজার পাওয়া যায়নি। UID বা ফোন নম্বর দিন:")
+        return
+    await state.update_data(target_uid=uid_input)
+    await AdminState.admin_edit_bal.set()
+    await message.answer(
+        f"✏️ <b>{u.get('name','?')}</b>\n"
+        f"💰 বর্তমান ব্যালেন্স: ৳{u.get('balance',0)}\n"
+        f"🎯 বর্তমান পয়েন্ট: {u.get('points',0)}\n\n"
+        f"ব্যালেন্স পরিবর্তন লিখুন (+যোগ / -বিয়োগ)\n"
+        f"উদাহরণ: 100 বা -50\n"
+        f"পরিবর্তন না করতে 0 লিখুন:"
+    )
+
+@dp.message_handler(state=AdminState.admin_edit_bal)
+async def admin_edit_get_bal(message: types.Message, state: FSMContext):
+    try:
+        delta_bal = float(message.text.strip())
+    except ValueError:
+        await message.answer("❌ সংখ্যা লিখুন। যেমন: 100 বা -50")
+        return
+    await state.update_data(delta_bal=delta_bal)
+    await AdminState.admin_edit_pts.set()
+    await message.answer(
+        f"পয়েন্ট পরিবর্তন লিখুন (+যোগ / -বিয়োগ)\n"
+        f"উদাহরণ: 200 বা -100\n"
+        f"পরিবর্তন না করতে 0 লিখুন:"
+    )
+
+@dp.message_handler(state=AdminState.admin_edit_pts)
+async def admin_edit_get_pts(message: types.Message, state: FSMContext):
+    try:
+        delta_pts = int(float(message.text.strip()))
+    except ValueError:
+        await message.answer("❌ সংখ্যা লিখুন।")
+        return
+    data = await state.get_data()
+    await state.finish()
+
+    target_uid = data["target_uid"]
+    delta_bal  = data["delta_bal"]
+
+    if delta_bal == 0 and delta_pts == 0:
+        await message.answer("⚠️ কোনো পরিবর্তন নেই।", reply_markup=admin_kb())
+        return
+
+    ok = fs_txn_add(target_uid, balance_delta=delta_bal, points_delta=delta_pts)
+    if ok:
+        u = get_user(target_uid) or {}
+        msg_parts = []
+        if delta_bal != 0:
+            msg_parts.append(f"💰 ব্যালেন্স: {'+' if delta_bal>0 else ''}৳{delta_bal} → ৳{u.get('balance',0)}")
+        if delta_pts != 0:
+            msg_parts.append(f"🎯 পয়েন্ট: {'+' if delta_pts>0 else ''}{delta_pts} → {u.get('points',0)}")
+        await message.answer(
+            f"✅ <b>এডিট সফল!</b>\n👤 {u.get('name','?')}\n" + "\n".join(msg_parts),
+            reply_markup=admin_kb()
+        )
+        try:
+            await bot.send_message(
+                int(target_uid),
+                f"📢 <b>আপনার একাউন্ট আপডেট হয়েছে।</b>\n" +
+                (f"💰 ব্যালেন্স পরিবর্তন: {'+' if delta_bal>0 else ''}৳{delta_bal}\n" if delta_bal != 0 else "") +
+                (f"🎯 পয়েন্ট পরিবর্তন: {'+' if delta_pts>0 else ''}{delta_pts}\n" if delta_pts != 0 else "")
+            )
+        except Exception:
+            pass
+    else:
+        await message.answer("❌ আপডেটে সমস্যা হয়েছে।", reply_markup=admin_kb())
+
+# ═══════════════════════════════════════════════════════
+#   ADMIN — ব্যান/আনব্যান (FSM)
+# ═══════════════════════════════════════════════════════
+@dp.message_handler(state=AdminState.ban_uid)
+async def admin_ban_get_uid(message: types.Message, state: FSMContext):
+    uid_input = message.text.strip()
+    u = get_user(uid_input)
+    if not u:
+        try:
+            docs = db.collection("users").where("phone", "==", uid_input).limit(1).get()
+            if docs:
+                uid_input = docs[0].id
+                u = docs[0].to_dict()
+        except Exception:
+            pass
+    if not u:
+        await message.answer("❌ ইউজার পাওয়া যায়নি। UID বা ফোন নম্বর দিন:")
+        return
+    await state.finish()
+
+    current_st = u.get("status", "active")
+    new_st = "active" if current_st == "banned" else "banned"
+    update_user(uid_input, {"status": new_st})
+
+    # ✅ active_users counter আপডেট — ban হলে -1, unban হলে +1
+    try:
+        delta = 1 if new_st == "active" else -1
+        db.collection("stats").document("main").set(
+            {"active_users": firestore.Increment(delta)}, merge=True
+        )
+    except Exception:
+        pass
+
+    action = "আনব্যান" if new_st == "active" else "ব্যান"
+    icon   = "✅" if new_st == "active" else "🚫"
+    await message.answer(
+        f"{icon} <b>{u.get('name','?')}</b> কে {action} করা হয়েছে।\n"
+        f"🆔 UID: <code>{uid_input}</code>",
+        reply_markup=admin_kb()
+    )
+    try:
+        msg = "✅ আপনার একাউন্ট পুনরায় একটিভ করা হয়েছে।" if new_st == "active" \
+              else "🚫 আপনার একাউন্ট সাময়িকভাবে বন্ধ করা হয়েছে। সাপোর্টে যোগাযোগ করুন।"
+        await bot.send_message(int(uid_input), msg)
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════
+#   ADMIN — সেটিংস আপডেট (FSM)
+# ═══════════════════════════════════════════════════════
+SETTING_FIELDS = {
+    "1": ("bkash",      "বিকাশ নম্বর",         str),
+    "2": ("nagad",      "নগদ নম্বর",           str),
+    "3": ("fee",        "ভেরিফিকেশন ফি (৳)",    float),
+    "4": ("earn1",      "লেভেল ১ আয় (৳)",       float),
+    "5": ("earn2",      "লেভেল ২ আয় (৳)",       float),
+    "6": ("earn3",      "লেভেল ৩ আয় (৳)",       float),
+    "7": ("lvl2Start",  "লেভেল ২ শুরু (পয়েন্ট)", int),
+    "8": ("lvl3Start",  "লেভেল ৩ শুরু (পয়েন্ট)", int),
+    "9": ("dailyBonus", "ডেইলি বোনাস (পয়েন্ট)", int),
+    "10":("notice",     "নোটিশ টেক্সট",          str),
+}
+
+@dp.message_handler(state=AdminState.set_field)
+async def admin_set_field(message: types.Message, state: FSMContext):
+    choice = message.text.strip()
+    if choice not in SETTING_FIELDS:
+        await message.answer("❌ সঠিক নম্বর দিন (১–১০):")
+        return
+    field_key, field_label, _ = SETTING_FIELDS[choice]
+    await state.update_data(set_choice=choice)
+    await AdminState.set_value.set()
+    s = get_settings()
+    current = s.get(field_key, "?")
+    await message.answer(
+        f"🔧 <b>{field_label}</b>\n"
+        f"বর্তমান মান: <code>{current}</code>\n\n"
+        f"নতুন মান লিখুন:\n(বাতিল: /cancel)"
+    )
+
+@dp.message_handler(state=AdminState.set_value)
+async def admin_set_value(message: types.Message, state: FSMContext):
+    data   = await state.get_data()
+    choice = data.get("set_choice")
+    await state.finish()
+
+    if choice not in SETTING_FIELDS:
+        await message.answer("❌ সমস্যা হয়েছে।", reply_markup=admin_kb())
+        return
+
+    field_key, field_label, cast = SETTING_FIELDS[choice]
+    raw = message.text.strip()
+    try:
+        new_val = cast(raw)
+    except (ValueError, TypeError):
+        await message.answer(f"❌ সঠিক মান দিন।", reply_markup=admin_kb())
+        return
+
+    try:
+        if RTDB_URL:
+            rtdb.reference("settings").update({field_key: new_val})
+        else:
+            fs_update("config", "settings", {field_key: new_val})
+        invalidate_settings_cache()
+        await message.answer(
+            f"✅ <b>{field_label}</b> আপডেট হয়েছে!\n"
+            f"নতুন মান: <code>{new_val}</code>",
+            reply_markup=admin_kb()
+        )
+    except Exception as e:
+        await message.answer(f"❌ আপডেটে সমস্যা: {e}", reply_markup=admin_kb())
+
+# ═══════════════════════════════════════════════════════
+#   ADMIN — Inline callback: search result থেকে এডিট/ব্যান
+# ═══════════════════════════════════════════════════════
+@dp.callback_query_handler(lambda c: c.data.startswith("admedit_"))
+async def cb_admin_edit(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("শুধু অ্যাডমিন!", show_alert=True)
+        return
+    uid_key = call.data.replace("admedit_", "")
+    u = get_user(uid_key) or {}
+    await state.update_data(target_uid=uid_key)
+    await AdminState.admin_edit_bal.set()
+    await call.message.answer(
+        f"✏️ <b>{u.get('name','?')}</b>\n"
+        f"💰 বর্তমান ব্যালেন্স: ৳{u.get('balance',0)}\n"
+        f"🎯 বর্তমান পয়েন্ট: {u.get('points',0)}\n\n"
+        f"ব্যালেন্স পরিবর্তন লিখুন (+/-):\n0 = পরিবর্তন নেই"
+    )
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("admban_"))
+async def cb_admin_ban(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("শুধু অ্যাডমিন!", show_alert=True)
+        return
+    parts      = call.data.split("_")
+    uid_key    = parts[1]
+    current_st = parts[2] if len(parts) > 2 else "active"
+    new_st     = "active" if current_st == "banned" else "banned"
+    update_user(uid_key, {"status": new_st})
+
+    # ✅ active_users counter আপডেট — ban হলে -1, unban হলে +1
+    try:
+        delta = 1 if new_st == "active" else -1
+        db.collection("stats").document("main").set(
+            {"active_users": firestore.Increment(delta)}, merge=True
+        )
+    except Exception:
+        pass
+
+    u      = get_user(uid_key) or {}
+    action = "আনব্যান ✅" if new_st == "active" else "ব্যান 🚫"
+    await call.answer(f"{u.get('name','?')} কে {action} করা হয়েছে!", show_alert=True)
+    try:
+        msg = "✅ আপনার একাউন্ট পুনরায় একটিভ।" if new_st == "active" \
+              else "🚫 আপনার একাউন্ট বন্ধ। সাপোর্টে যোগাযোগ করুন।"
+        await bot.send_message(int(uid_key), msg)
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════════
 #   MISC COMMANDS
@@ -2056,11 +2556,15 @@ async def cmd_status(message: types.Message, state: FSMContext):
 
 @dp.message_handler(commands=['support'], state="*")
 async def cmd_support(message: types.Message, state: FSMContext):
+    # ✅ RTDB থেকে support contact আনো — Admin Panel থেকে আপডেট করা যায়
+    s = get_settings()
+    tg = s.get("supportTg", "support_username")
+    wa = s.get("supportWa", "01XXXXXXXXX")
     await message.answer(
         "📞 <b>কাস্টমার সাপোর্ট</b>\n\n"
         "যেকোনো সমস্যায় আমাদের সাথে যোগাযোগ করুন:\n\n"
-        "• Telegram: @support_username\n"
-        "• WhatsApp: 01XXXXXXXXX\n\n"
+        f"• Telegram: @{tg}\n"
+        f"• WhatsApp: {wa}\n\n"
         "সমস্যা রিপোর্ট করতে /report লিখুন।"
     )
 
@@ -2084,6 +2588,60 @@ async def cmd_report(message: types.Message, state: FSMContext):
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer("❌ বাতিল করা হয়েছে।", reply_markup=main_kb())
+
+# ═══════════════════════════════════════════════════════
+#   ADMIN — /reports  (local cache থেকে দেখো, delete করো)
+# ═══════════════════════════════════════════════════════
+@dp.message_handler(lambda m: m.from_user.id == ADMIN_ID, commands=['reports'], state="*")
+async def cmd_admin_reports(message: types.Message, state: FSMContext):
+    if not _report_cache:
+        await message.answer("📭 কোনো রিপোর্ট নেই।", reply_markup=admin_kb())
+        return
+
+    total = len(_report_cache)
+    await message.answer(
+        f"🚨 <b>রিপোর্ট ইনবক্স</b> — মোট {total} টি\n"
+        f"(সর্বশেষ ২০টা দেখাচ্ছে)\n\n"
+        f"সমাধান হলে ডিলিট বাটনে চাপুন:",
+        reply_markup=admin_kb()
+    )
+
+    # সর্বশেষ ২০টা — নতুন থেকে পুরনো
+    for r in list(reversed(_report_cache))[:20]:
+        dt = datetime.fromtimestamp(r["ts"] / 1000).strftime("%d/%m %H:%M")
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(
+            "🗑 সমাধান হয়েছে — ডিলিট করুন",
+            callback_data=f"report_del_{r['idx']}"
+        ))
+        await message.answer(
+            f"👤 <b>{r['name']}</b> | 📞 {r['phone']}\n"
+            f"📝 {r['msg']}\n"
+            f"🕐 {dt} | <code>{r['uid']}</code>",
+            reply_markup=kb
+        )
+        await asyncio.sleep(0.1)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("report_del_"))
+async def cb_report_delete(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("শুধু অ্যাডমিন!", show_alert=True)
+        return
+    try:
+        idx = int(call.data.replace("report_del_", ""))
+    except ValueError:
+        await call.answer("❌ সমস্যা হয়েছে।", show_alert=True)
+        return
+
+    deleted = report_cache_delete(idx)
+    if deleted:
+        await call.answer("✅ রিপোর্ট ডিলিট হয়েছে!", show_alert=False)
+        try:
+            await call.message.delete()
+        except Exception:
+            await call.message.edit_reply_markup(reply_markup=None)
+    else:
+        await call.answer("⚠️ রিপোর্টটি আগেই মুছে গেছে।", show_alert=True)
 
 # ═══════════════════════════════════════════════════════
 #   FALLBACK
@@ -2115,11 +2673,103 @@ async def cleanup_old_cache():
 # ═══════════════════════════════════════════════════════
 #   MAIN
 # ═══════════════════════════════════════════════════════
+CHANNEL_USERNAME = "@project_xx7"  # ✅ আপনার চ্যানেল
+
+async def on_startup():
+    """Bot চালু হলে channel-এ notify পাঠাও এবং broadcast watcher শুরু করো।"""
+    try:
+        await bot.send_message(
+            CHANNEL_USERNAME,
+            f"✅ <b>IncomeApp Bot চালু হয়েছে!</b>\n"
+            f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+        )
+        log.info(f"✅ Startup notification sent to {CHANNEL_USERNAME}")
+    except Exception as e:
+        log.warning(f"Channel startup notify failed: {e}")
+
+# ═══════════════════════════════════════════════════════
+#   ADMIN PANEL BROADCAST WATCHER
+#   Admin Panel RTDB-তে admin_broadcast লিখলে bot দেখে পাঠায়।
+# ═══════════════════════════════════════════════════════
+async def watch_admin_broadcast():
+    """
+    Admin Panel থেকে broadcast করলে RTDB-তে admin_broadcast node লেখে।
+    Bot প্রতি ১০ সেকেন্ডে চেক করে — pending থাকলে পাঠিয়ে done করে।
+    """
+    while True:
+        try:
+            if RTDB_URL:
+                bc_ref = _rtdb_ref("admin_broadcast")
+                if bc_ref:
+                    data = bc_ref.get()
+                    if data and isinstance(data, dict) and data.get("status") == "pending":
+
+                        # ✅ FIX 1: খালি message হলে crash না করে error mark করো
+                        msg_text = (data.get("message") or "").strip()
+                        if not msg_text:
+                            bc_ref.update({"status": "error", "error": "empty_message"})
+                            log.warning("Broadcast skipped: empty message")
+                            await asyncio.sleep(10)
+                            continue
+
+                        # duplicate broadcast ঠেকাতে আগে processing করো
+                        bc_ref.update({"status": "processing"})
+                        log.info("Admin Panel broadcast received, sending...")
+
+                        try:
+                            docs = db.collection("users").select([]).get()
+                            uid_list = [doc.id for doc in docs]
+                        except Exception as e:
+                            log.error(f"Broadcast user fetch error: {e}")
+                            bc_ref.update({"status": "error", "error": str(e)})
+                            await asyncio.sleep(10)
+                            continue
+
+                        sent = failed = 0
+                        BATCH = 25
+                        for i, uid_str in enumerate(uid_list):
+                            try:
+                                await bot.send_message(
+                                    int(uid_str),
+                                    f"📢 <b>নতুন আপডেট:</b>\n\n{msg_text}"
+                                )
+                                sent += 1
+                            except Exception:
+                                failed += 1
+                            await asyncio.sleep(0.05)
+                            if (i + 1) % BATCH == 0:
+                                await asyncio.sleep(2)
+
+                        bc_ref.update({
+                            "status": "done",
+                            "sent":   sent,
+                            "failed": failed,
+                            "doneAt": int(time.time() * 1000),
+                        })
+                        log.info(f"Broadcast done: sent={sent} failed={failed}")
+
+                        try:
+                            await bot.send_message(
+                                ADMIN_ID,
+                                f"✅ <b>ব্রডকাস্ট সম্পন্ন!</b>\n"
+                                f"📤 পাঠানো: {bn(sent)} জন\n"
+                                f"❌ ব্যর্থ: {bn(failed)} জন",
+                                reply_markup=admin_kb()
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            log.debug(f"watch_admin_broadcast error: {e}")
+        await asyncio.sleep(10)
+
+
 if __name__ == '__main__':
     keep_alive()
     log.info("IncomeApp Bot starting (Firestore mode)...")
 
     loop = asyncio.get_event_loop()
+    loop.run_until_complete(on_startup())          # ✅ startup notification
     loop.create_task(watch_admin_paid_notifications())
+    loop.create_task(watch_admin_broadcast())       # ✅ Admin Panel broadcast watcher
     loop.create_task(cleanup_old_cache())
     executor.start_polling(dp, skip_updates=True, loop=loop)
