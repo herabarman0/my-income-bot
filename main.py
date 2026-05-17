@@ -1053,7 +1053,10 @@ async def pay_txn_id(message: types.Message, state: FSMContext):
         f"UID: <code>{uid}</code>  |  VID: <code>{vid}</code>"
     )
     try:
-        await bot.send_message(ADMIN_ID, admin_text, reply_markup=approve_reject_kb(f"{uid}|{vid}", "ver"))
+        admin_msg = await bot.send_message(ADMIN_ID, admin_text, reply_markup=approve_reject_kb(f"{uid}|{vid}", "ver"))
+        # ✅ Admin message ID সেভ করো — পরে Admin Panel থেকে action হলে bot edit করবে
+        if vid and admin_msg:
+            fs_update("verifications", vid, {"adminMsgId": admin_msg.message_id})
     except Exception as e:
         log.warning(f"Admin notify error: {e}")
 
@@ -1111,7 +1114,12 @@ async def cb_approve_ver(call: types.CallbackQuery):
         await call.message.answer(f"❌ ইউজার পাওয়া যায়নি! UID: {uid}")
         return
     if result == "already_active":
-        await call.message.answer(f"⚠️ এই ইউজার আগেই Active আছে! UID: <code>{uid}</code>")
+        old_text = call.message.text or ""
+        new_text = old_text + f"\n\n✅ ইতোমধ্যে Active আছে — {datetime.now().strftime('%d/%m %H:%M')}"
+        try:
+            await call.message.edit_text(new_text, reply_markup=None)
+        except Exception:
+            await call.message.answer(f"⚠️ এই ইউজার আগেই Active আছে! UID: <code>{uid}</code>")
         return
 
     if vid:
@@ -1192,6 +1200,19 @@ async def cb_reject_ver(call: types.CallbackQuery):
     parts = call.data.replace("reject_ver_", "").split("|")
     uid   = parts[0]
     vid   = parts[1] if len(parts) > 1 else None
+
+    # ✅ double-action চেক — Admin Panel আগে reject করে থাকলে
+    user_now = get_user(uid)
+    if user_now and user_now.get("status") not in ("pending", "review", "new"):
+        st = user_now.get("status", "?")
+        icon = "✅" if st == "active" else "❌"
+        old_text = call.message.text or ""
+        new_text = old_text + f"\n\n{icon} ইতোমধ্যে প্রসেস হয়েছে ({st}) — {datetime.now().strftime('%d/%m %H:%M')}"
+        try:
+            await call.message.edit_text(new_text, reply_markup=None)
+        except Exception:
+            await call.message.answer(f"⚠️ ইতোমধ্যে প্রসেস হয়েছে (status: {st}) — UID: <code>{uid}</code>")
+        return
 
     update_user(uid, {"status": "rejected"})
     if vid:
@@ -1601,7 +1622,10 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
         f"UID: <code>{uid}</code>  |  WID: <code>{wid}</code>"
     )
     try:
-        await bot.send_message(ADMIN_ID, admin_text, reply_markup=paid_reject_kb(wid))
+        admin_msg = await bot.send_message(ADMIN_ID, admin_text, reply_markup=paid_reject_kb(wid))
+        # ✅ Admin message ID সেভ করো — পরে Admin Panel থেকে action হলে bot edit করবে
+        if admin_msg:
+            fs_update("withdrawals", wid, {"adminMsgId": admin_msg.message_id})
     except Exception as e:
         log.warning(f"Withdraw notify error: {e}")
 
@@ -1630,7 +1654,22 @@ async def cb_mark_paid(call: types.CallbackQuery):
         await call.message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি!")
         return
     if w.get("status") in ("paid", "success"):
-        await call.message.answer("⚠️ এটা আগেই পেমেন্ট হয়ে গেছে!")
+        old_text = call.message.text or ""
+        if "PAID" not in old_text and "REJECTED" not in old_text:
+            new_text = old_text + f"\n\n✅ ইতোমধ্যে PAID — {datetime.now().strftime('%d/%m %H:%M')}"
+            try:
+                await call.message.edit_text(new_text, reply_markup=None)
+            except Exception:
+                pass
+        return
+    if w.get("status") == "rejected":
+        old_text = call.message.text or ""
+        if "REJECTED" not in old_text and "PAID" not in old_text:
+            new_text = old_text + f"\n\n❌ ইতোমধ্যে REJECTED — {datetime.now().strftime('%d/%m %H:%M')}"
+            try:
+                await call.message.edit_text(new_text, reply_markup=None)
+            except Exception:
+                pass
         return
 
     uid    = w.get("uid")
@@ -1663,10 +1702,22 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
         await call.message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি!")
         return
     if w.get("status") in ("paid", "success"):
-        await call.message.answer("⚠️ এই উইথড্র আগেই পেমেন্ট হয়ে গেছে!")
+        old_text = call.message.text or ""
+        if "PAID" not in old_text and "REJECTED" not in old_text:
+            new_text = old_text + f"\n\n✅ ইতোমধ্যে PAID — {datetime.now().strftime('%d/%m %H:%M')}"
+            try:
+                await call.message.edit_text(new_text, reply_markup=None)
+            except Exception:
+                pass
         return
     if w.get("status") == "rejected":
-        await call.message.answer("⚠️ এটা আগেই রিজেক্ট হয়েছে!")
+        old_text = call.message.text or ""
+        if "REJECTED" not in old_text and "PAID" not in old_text:
+            new_text = old_text + f"\n\n❌ ইতোমধ্যে REJECTED — {datetime.now().strftime('%d/%m %H:%M')}"
+            try:
+                await call.message.edit_text(new_text, reply_markup=None)
+            except Exception:
+                pass
         return
 
     fs_update("withdrawals", wid, {"status": "rejected", "rejectedAt": int(time.time() * 1000)})
@@ -1686,6 +1737,20 @@ async def cb_reject_withdraw(call: types.CallbackQuery):
 # ═══════════════════════════════════════════════════════
 #   NOTIFICATION HELPERS
 # ═══════════════════════════════════════════════════════
+async def _edit_admin_msg(msg_id: int, old_text: str, suffix: str):
+    """Admin-এর Telegram message edit করে button সরিয়ে দাও।"""
+    try:
+        new_text = old_text + suffix if old_text else suffix
+        await bot.edit_message_text(
+            chat_id=ADMIN_ID,
+            message_id=msg_id,
+            text=new_text,
+            reply_markup=None,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        log.debug(f"_edit_admin_msg error msg_id={msg_id}: {e}")
+
 async def _notify_user_paid(uid: str, w: dict):
     try:
         await bot.send_message(
@@ -1711,34 +1776,126 @@ async def _notify_user_rejected(uid: str, w: dict):
 
 async def watch_admin_paid_notifications():
     """
-    FIX 2: Admin Panel থেকে paid করলে ইউজারকে notify করে।
-    notifyPending=True field দিয়ে চেক করে — আগের >= query কাজ করত না।
-    Admin Panel-এ cb_mark_paid এ notifyPending=True সেট করতে হবে।
+    Admin Panel থেকে paid/reject করলে ইউজারকে notify করে।
+    দুটো field চেক করে:
+      - notifyPending=True  → bot নিজে paid করেছে (cb_mark_paid)
+      - adminPaidNotify=uid → Admin Panel থেকে paid করেছে (markPaid)
+      - adminRejectNotify=uid → Admin Panel থেকে reject করেছে (rejectWit)
+      - adminVerRejectNotify=uid → Admin Panel থেকে ver reject (rejectVer)
     প্রতি ৮ সেকেন্ডে চেক করে।
     """
     while True:
         try:
-            # ✅ notifyPending=True field দিয়ে query — সঠিকভাবে কাজ করে
-            docs = db.collection("withdrawals")\
+            # ── ১. notifyPending=True (bot এর cb_mark_paid থেকে) ──
+            docs1 = db.collection("withdrawals")\
                 .where("notifyPending", "==", True)\
                 .limit(20)\
                 .get()
-            for doc in docs:
+            for doc in docs1:
                 wid = doc.id
                 w   = doc.to_dict()
                 notify_uid = w.get("uid")
                 if notify_uid:
-                    # ✅ আগে field মুছো — duplicate notify ঠেকাতে
                     fs_update("withdrawals", wid, {"notifyPending": firestore.DELETE_FIELD})
                     await _notify_user_paid(notify_uid, w)
-                    # ✅ Admin Panel থেকে paid করলে RTDB stats আপডেট
                     try:
                         amt  = float(w.get("amount", 0))
                         name = w.get("name", "?")
                         rtdb_stats_new_withdrawal(amt, notify_uid, name)
                     except Exception as _se:
                         log.error(f"watch stats update error: {_se}")
-                    log.info(f"Admin paid notify sent: uid={notify_uid} wid={wid}")
+                    log.info(f"Bot paid notify sent: uid={notify_uid} wid={wid}")
+
+            # ── ২. adminPaidNotify=uid (Admin Panel markPaid থেকে) ──
+            docs2 = db.collection("withdrawals")\
+                .where("adminPaidNotify", "!=", "")\
+                .limit(20)\
+                .get()
+            for doc in docs2:
+                wid = doc.id
+                w   = doc.to_dict()
+                notify_uid = w.get("adminPaidNotify", "")
+                if notify_uid and notify_uid != "done":
+                    # আগে field মার্ক করো — duplicate ঠেকাতে
+                    fs_update("withdrawals", wid, {"adminPaidNotify": "done"})
+                    await _notify_user_paid(notify_uid, w)
+                    try:
+                        amt  = float(w.get("amount", 0))
+                        name = w.get("name", "?")
+                        rtdb_stats_new_withdrawal(amt, notify_uid, name)
+                    except Exception as _se:
+                        log.error(f"watch admin paid stats error: {_se}")
+                    # ✅ Telegram message button সরিয়ে দাও
+                    msg_id = w.get("adminMsgId")
+                    if msg_id:
+                        suffix = f"\n\n✅ PAID (Admin Panel) — {datetime.now().strftime('%d/%m %H:%M')}"
+                        old_txt = (doc.to_dict().get("_adminMsgText") or "")
+                        await _edit_admin_msg(int(msg_id), old_txt, suffix)
+                    log.info(f"Admin Panel paid notify sent: uid={notify_uid} wid={wid}")
+
+            # ── ৩. adminRejectNotify=uid (Admin Panel rejectWit থেকে) ──
+            docs3 = db.collection("withdrawals")\
+                .where("adminRejectNotify", "!=", "")\
+                .limit(20)\
+                .get()
+            for doc in docs3:
+                wid = doc.id
+                w   = doc.to_dict()
+                notify_uid = w.get("adminRejectNotify", "")
+                if notify_uid and notify_uid != "done":
+                    fs_update("withdrawals", wid, {"adminRejectNotify": "done"})
+                    await _notify_user_rejected(notify_uid, w)
+                    # ✅ Telegram message button সরিয়ে দাও
+                    msg_id = w.get("adminMsgId")
+                    if msg_id:
+                        suffix = f"\n\n❌ REJECTED (Admin Panel) — {datetime.now().strftime('%d/%m %H:%M')}"
+                        await _edit_admin_msg(int(msg_id), "", suffix)
+                    log.info(f"Admin Panel reject notify sent: uid={notify_uid} wid={wid}")
+
+            # ── ৪. adminVerRejectNotify=uid (Admin Panel rejectVer থেকে) ──
+            docs4 = db.collection("verifications")\
+                .where("adminVerRejectNotify", "!=", "")\
+                .limit(20)\
+                .get()
+            for doc in docs4:
+                vid = doc.id
+                v   = doc.to_dict()
+                notify_uid = v.get("adminVerRejectNotify", "")
+                if notify_uid and notify_uid != "done":
+                    fs_update("verifications", vid, {"adminVerRejectNotify": "done"})
+                    try:
+                        await bot.send_message(
+                            int(notify_uid),
+                            "❌ <b>পেমেন্ট ভেরিফিকেশন ব্যর্থ হয়েছে।</b>\n\n"
+                            "ট্রান্জেকশন আইডি সঠিক ছিল না।\n"
+                            "পুনরায় সঠিক পেমেন্ট করে /pay দিন।"
+                        )
+                    except Exception as _ne:
+                        log.warning(f"Ver reject notify error uid={notify_uid}: {_ne}")
+                    # ✅ Telegram message button সরিয়ে দাও
+                    msg_id = v.get("adminMsgId")
+                    if msg_id:
+                        suffix = f"\n\n❌ REJECTED (Admin Panel) — {datetime.now().strftime('%d/%m %H:%M')}"
+                        await _edit_admin_msg(int(msg_id), "", suffix)
+                    log.info(f"Admin Panel ver-reject notify sent: uid={notify_uid} vid={vid}")
+
+            # ── ৫. adminVerApproveEdit — Admin Panel approveVer করলে Telegram message edit ──
+            docs5 = db.collection("verifications")\
+                .where("adminVerApproveEdit", "!=", "")\
+                .limit(20)\
+                .get()
+            for doc in docs5:
+                vid = doc.id
+                v   = doc.to_dict()
+                edit_flag = v.get("adminVerApproveEdit", "")
+                if edit_flag and edit_flag != "done":
+                    fs_update("verifications", vid, {"adminVerApproveEdit": "done"})
+                    msg_id = v.get("adminMsgId")
+                    if msg_id:
+                        suffix = f"\n\n✅ APPROVED (Admin Panel) — {datetime.now().strftime('%d/%m %H:%M')}"
+                        await _edit_admin_msg(int(msg_id), "", suffix)
+                    log.info(f"Admin Panel ver-approve edit done vid={vid}")
+
         except Exception as e:
             log.debug(f"watch_admin_paid_notifications error: {e}")
         await asyncio.sleep(8)
@@ -1823,16 +1980,29 @@ async def report_message(message: types.Message, state: FSMContext):
 
     await message.answer("✅ <b>রিপোর্ট পাঠানো হয়েছে।</b>\n\nঅ্যাডমিন শীঘ্রই ব্যবস্থা নেবেন।", reply_markup=main_kb())
 
-    # ✅ Firestore-এ সেভ করো তারপর সাথে সাথে মুছো — cache-এ আছে
-    rid = fs_add("reports", {
+    # ✅ RTDB-তে সেভ করো — Admin Panel সরাসরি এখান থেকে পড়বে
+    report_rtdb_data = {
         "uid":       uid,
         "name":      user.get("name", "?"),
         "phone":     user.get("phone", "?"),
         "message":   raw_text,
         "createdAt": int(time.time() * 1000),
-    })
-    if rid:
-        asyncio.create_task(_auto_delete_report(rid))  # FIX 3: ensure_future deprecated, create_task ব্যবহার করো
+        "read":      False,
+    }
+    if RTDB_URL:
+        try:
+            rtdb.reference("reports").push(report_rtdb_data)
+        except Exception as _re:
+            log.error(f"RTDB report save error: {_re}")
+            # fallback: Firestore-এ সেভ করো
+            rid = fs_add("reports", report_rtdb_data)
+            if rid:
+                asyncio.create_task(_auto_delete_report(rid))
+    else:
+        # RTDB না থাকলে Firestore-এ সেভ করো তারপর মুছো — cache-এ আছে
+        rid = fs_add("reports", report_rtdb_data)
+        if rid:
+            asyncio.create_task(_auto_delete_report(rid))
 
 # ═══════════════════════════════════════════════════════
 #   ADMIN MENU HANDLERS
